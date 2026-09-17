@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Runtime data & secrets (credentials, cookies, logs, reports)
+data/
+!data/.gitkeep
+
+# Distribution packages (build artifacts)
+分发包/
+dist/
+
+# Tools downloaded by installer
+tools/
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+*.swp
+.idea/
+.vscode/
+
+# Local env
+.env
+.env.*

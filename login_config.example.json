@@ -1,0 +1,11 @@
+{
+  "username": "",
+  "password_b64": "",
+  "listUrl": "work_packages?query_id=1",
+  "versionOrder": "1.0.0",
+  "responsible": "",
+  "tester": "",
+  "dingtalkEnabled": false,
+  "dingtalkWebhook": "",
+  "dingtalkSecret": ""
+}

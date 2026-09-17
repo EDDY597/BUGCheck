@@ -1,0 +1,14 @@
+{
+  "name": "bug-validation-tool",
+  "version": "2.1.0",
+  "private": true,
+  "description": "OpenProject BUG 校验工具",
+  "main": "src/validate-server.js",
+  "scripts": {
+    "start": "node src/validate-server.js",
+    "once": "node src/validate-server.js --once"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}
