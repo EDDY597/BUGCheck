@@ -85,7 +85,7 @@
 | `alpha` | Alpha | Alpha Release | Bug backlog |
 | `feature` / `feat` | Feature | Dev | 从控制器版本提取的 `1.x.y` |
 | `beta` | Beta | Beta Release | Bug backlog |
-| 其它（无上述关键词） | Stable | **Product Release** | **Product backlog** |
+| 其它（无上述关键词） | Stable | **Product Release** | **Bug backlog** |
 
 ### 5.3 版本链路（可配置）
 

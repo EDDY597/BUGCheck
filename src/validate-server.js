@@ -1546,10 +1546,10 @@ async function validateBugs(onLogCallback, options = {}) {
           } else if (vt === 'stable') {
             if (skipVersion) {
               versionDetails.push('⏭️ 版本(Version) 被龙燕修改，跳过校验（当前: ' + (bug.version || '空') + '）');
-            } else if (bug.version.toLowerCase() !== 'product backlog') {
-              versionDetails.push('❌ 版本应为"Product backlog"，当前: ' + bug.version);
+            } else if (bug.version.toLowerCase() !== 'bug backlog') {
+              versionDetails.push('❌ 版本应为"Bug backlog"，当前: ' + bug.version);
             } else {
-              versionDetails.push('✓ 版本 = Product backlog ✓');
+              versionDetails.push('✓ 版本 = Bug backlog ✓');
             }
           } else if (vt === 'rc' || vt === 'pre' || vt === 'alpha' || vt === 'beta') {
             if (skipVersion) {
