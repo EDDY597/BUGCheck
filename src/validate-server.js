@@ -1180,7 +1180,19 @@ async function validateBugs(onLogCallback, options = {}) {
         const valEl = el.querySelector('.wp-attribute-group--attribute-value-container');
         if (keyEl) {
           const key = (keyEl.innerText || '').replace(/\s*\*+\s*$/, '').trim();
-          const val = valEl ? (valEl.innerText || '').trim() : '';
+          let val = valEl ? (valEl.innerText || '').trim() : '';
+          // hierarchy 模块/工艺：innerText 偶发空时用 title / path 拼接
+          if (!val && valEl) {
+            const hier = valEl.querySelector('.hierarchy-items, .inline-edit--display-field');
+            if (hier) {
+              val = (hier.getAttribute('title') || '').trim();
+              if (!val) {
+                const path = hier.querySelector('.path');
+                if (path) val = (path.innerText || path.textContent || '').trim();
+              }
+              if (!val) val = (hier.textContent || '').trim();
+            }
+          }
           if (key) attrs[key] = val;
         }
       });
@@ -1218,51 +1230,65 @@ async function validateBugs(onLogCallback, options = {}) {
     });
   }
 
+  async function waitForPageReady(tab, timeoutMs) {
+    // 页面就绪：无 busy，且「非空属性数量」连续稳定（表示 customField 基本写完）
+    await tab.waitForFunction(() => {
+      if ((document.readyState || '') !== 'complete') return false;
+      if (document.querySelector('[aria-busy="true"]')) return false;
+      if (document.querySelector('turbo-frame[busy]')) return false;
+      if (document.querySelector('.loading-indicator, loading-indicator, [class*="spinner"]')) return false;
+      return document.querySelectorAll('.wp-attribute-group--attribute').length > 0;
+    }, { timeout: timeoutMs || 8000 }).catch(() => {});
+    try { await tab.waitForLoadState('networkidle', { timeout: 4000 }); } catch {}
+
+    const countFn = () => {
+      const els = document.querySelectorAll('.wp-attribute-group--attribute');
+      let n = 0;
+      for (let i = 0; i < els.length; i++) {
+        const v = els[i].querySelector('.wp-attribute-group--attribute-value-container');
+        let t = v ? (v.innerText || '').trim() : '';
+        if (!t && v) {
+          const hier = v.querySelector('.hierarchy-items, .inline-edit--display-field');
+          if (hier) t = (hier.getAttribute('title') || hier.textContent || '').trim();
+        }
+        if (t && t !== '-' && t !== '…') n++;
+      }
+      return n;
+    };
+    let last = -1;
+    let stable = 0;
+    for (let i = 0; i < 20; i++) {
+      const n = await tab.evaluate(countFn);
+      if (n > 0 && n === last) {
+        stable++;
+        if (stable >= 2) break;
+      } else {
+        stable = 0;
+      }
+      last = n;
+      await tab.waitForTimeout(150);
+    }
+    await tab.waitForTimeout(200);
+  }
+
   async function fetchBugDetail(id) {
     const tab = await context.newPage();
     try {
-      // 带 activity 的 URL：属性 + 活动区 journal 一次出全，避免龙燕丢失
       const url = opOrigin + '/work_packages/' + id + '/activity';
       await tab.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await tab.waitForFunction(() => {
-        const el = document.querySelector('.work-packages--details--subject, .subject');
-        return !!(el && (el.innerText || '').trim());
-      }, { timeout: 6000 }).catch(() => {});
-      await tab.waitForFunction(() => {
-        function keyOf(el) {
-          const k = el.querySelector('.wp-attribute-group--attribute-key');
-          return k ? (k.innerText || '').replace(/\s*\*+\s*$/, '').trim() : '';
-        }
-        function valOf(el) {
-          const v = el.querySelector('.wp-attribute-group--attribute-value-container');
-          return v ? (v.innerText || '').trim() : '';
-        }
-        const els = [...document.querySelectorAll('.wp-attribute-group--attribute')];
-        if (els.length < 15) return false;
-        const mod = els.find(e => keyOf(e) === '模块');
-        if (mod && valOf(mod) && valOf(mod) !== '-') return true;
-        return ['负责人', '版本', '受理人'].some(n => {
-          const el = els.find(e => keyOf(e) === n);
-          return el && valOf(el) && valOf(el) !== '-';
+      await waitForPageReady(tab, 8000);
+
+      function hasRealAttrValue(attrs) {
+        return Object.keys(attrs || {}).some(k => {
+          const v = attrs[k];
+          return v && String(v).trim() && String(v).trim() !== '-';
         });
-      }, { timeout: 4000 }).catch(() => {});
-      // 活动区 journal 可能略晚于属性
-      await tab.waitForSelector(
-        '.work-packages-activities-tab-journals-item-component',
-        { timeout: 4000 }
-      ).catch(() => {});
+      }
 
       let data = await scrapeOnce(tab);
-      if (!data.subject) {
+      if (!data.subject || !hasRealAttrValue(data.attrs)) {
         await tab.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-        await tab.waitForFunction(() => {
-          const el = document.querySelector('.work-packages--details--subject, .subject');
-          return !!(el && (el.innerText || '').trim());
-        }, { timeout: 5000 }).catch(() => {});
-        await tab.waitForSelector(
-          '.work-packages-activities-tab-journals-item-component',
-          { timeout: 3000 }
-        ).catch(() => {});
+        await waitForPageReady(tab, 6000);
         data = await scrapeOnce(tab);
       }
 
