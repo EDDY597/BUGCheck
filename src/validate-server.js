@@ -729,7 +729,9 @@ function renderValidationResult(result, opts) {
       if (!check) continue;
       const label = key === '必填项' ? '' : '【' + key + '】<br>';
       const colored = check.details.map(d => {
-        if (d.startsWith('❌') || d.startsWith('⚠️')) return '<span style="color:#d00;font-weight:bold">' + d + '</span>';
+        if (d.startsWith('❌') || d.startsWith('⚠️') || d.includes('龙燕') || d.includes('黄贵良') ||
+            (d.startsWith('⏭️') && d.includes('修改')))
+          return '<span style="color:#d00;font-weight:bold">' + d + '</span>';
         if (d.startsWith('✓') || d.startsWith('⏭️')) return '<span style="color:#0a0">' + d + '</span>';
         return d;
       });
@@ -740,7 +742,8 @@ function renderValidationResult(result, opts) {
     const versionCheck = bug.checks.find(c => c.name === '版本');
     if (versionCheck) {
       const styledDetails = versionCheck.details.map(d => {
-        if (d.includes('龙燕') || d.startsWith('❌') || d.startsWith('🔄'))
+        if (d.includes('龙燕') || d.includes('黄贵良') || d.startsWith('❌') || d.startsWith('🔄') ||
+            (d.startsWith('⏭️') && d.includes('修改')))
           return '<span style="color:#d00;font-weight:bold">' + d + '</span>';
         if (d.startsWith('✓') || d.startsWith('✅') || d.startsWith('📋') || d.startsWith('⏭️') || d.includes('通过'))
           return '<span style="color:#0a0">' + d + '</span>';
@@ -898,7 +901,7 @@ function extractCtrlVersion(desc) {
 
 // 不在结果中展示的修改字段（仍会参与跳过，只是不展示明细）
 const LY_DISPLAY_HIDE = ['受理人', 'Dev'];
-// 触发「改过即跳过」的人员：龙燕 或 黄贵良（输出文案仍写「龙燕」）
+// 触发「改过即跳过」的人员：龙燕 / 黄贵良等（文案按实际修改人显示）
 const LY_USER_NAMES = ['龙燕', '黄贵良'];
 
 function isLyUserName(name) {
@@ -925,45 +928,65 @@ function isHiddenLyField(name) {
 function parseLyFieldName(seg) {
   const s = String(seg || '').trim();
   if (!s) return '';
-  let m = s.match(/^(.+?)\s*已从\s+/);
-  if (!m) m = s.match(/^(.+?)\s*已更改/);
-  if (!m) m = s.match(/^(.+?)\s*已设置/);
-  if (!m) m = s.match(/^(.+?)\s*已清空/);
-  if (!m) m = s.match(/^(.+?)\s*已删除/);
+  // journal 文案可能是「设置为 / 已设置 / 更改为 / 已从 …」
+  let m = s.match(/^(.+?)\s*(?:已)?从\s+/);
+  if (!m) m = s.match(/^(.+?)\s*(?:已)?更改/);
+  if (!m) m = s.match(/^(.+?)\s*(?:已)?设置/);
+  if (!m) m = s.match(/^(.+?)\s*(?:已)?清空/);
+  if (!m) m = s.match(/^(.+?)\s*(?:已)?删除/);
   if (!m) return '';
   return m[1].trim().replace(/[（(].*$/, '').trim();
 }
 
-// 从龙燕 journal 提取被改过的字段名
-// 一条 journal 可能含多个字段：「受理人 已从 A 更改为 B；版本 已从 X 更改为 Y」
+// 字段名 → 修改过该字段的人（Set）
 function extractLongYanSkipFields(longYanChanges) {
-  const fields = new Set();
+  const map = new Map();
   for (const c of longYanChanges || []) {
+    const who = (c.user || '').trim() || '特殊人员';
     const d = (c.detail || '').trim();
     if (!d || d.startsWith('(')) continue;
     const segs = d.split(/[；;]+/).map(s => s.trim()).filter(Boolean);
     for (const seg of segs) {
       const name = parseLyFieldName(seg);
-      if (name) fields.add(name);
+      if (!name) continue;
+      if (!map.has(name)) map.set(name, new Set());
+      map.get(name).add(who);
     }
   }
-  return fields;
+  return map;
 }
 
-function lySkip(fields, ...names) {
+function lyFieldMatched(map, ...names) {
   for (const n of names) {
-    if (fields.has(n)) return true;
-    for (const f of fields) {
+    if (map.has(n)) return true;
+    for (const f of map.keys()) {
       if (f === n) return true;
-      // 「版本」匹配「版本(Version)」；避免用 includes 误伤「发现BUG版本」
       if (f.startsWith(n) || n.startsWith(f)) return true;
     }
   }
   return false;
 }
 
+function lySkip(fields, ...names) {
+  return lyFieldMatched(fields, ...names);
+}
+
+// 「龙燕、黄贵良」这类实际修改人
+function lyWho(map, ...names) {
+  const who = new Set();
+  for (const n of names) {
+    for (const [f, users] of map.entries()) {
+      if (f === n || f.startsWith(n) || n.startsWith(f)) {
+        users.forEach(u => who.add(u));
+      }
+    }
+  }
+  if (!who.size) return '特殊人员';
+  return Array.from(who).join('、');
+}
+
 function formatLyFieldList(lyFields) {
-  return Array.from(lyFields).filter(f => !isHiddenLyField(f)).join('、');
+  return Array.from(lyFields.keys ? lyFields.keys() : lyFields).filter(f => !isHiddenLyField(f)).join('、');
 }
 
 function formatLyChangeLine(c) {
@@ -974,7 +997,8 @@ function formatLyChangeLine(c) {
     return true;
   });
   if (!keep.length) return '';
-  return (c.time ? c.time + ' ' : '') + keep.join('；');
+  const who = (c.user || '').trim();
+  return (who ? who + ' ' : '') + (c.time ? c.time + ' ' : '') + keep.join('；');
 }
 
 // 主校验逻辑
@@ -1218,20 +1242,27 @@ async function validateBugs(onLogCallback, options = {}) {
       const titleEl = document.querySelector('.work-packages--details--subject, .subject');
       const longYanChanges = [];
       document.querySelectorAll('.work-packages-activities-tab-journals-item-component').forEach(el => {
+        const LY_USERS = ['龙燕', '黄贵良'];
         const userEl = el.querySelector('.work-packages-activities-tab-journals-item-component-details--user-name');
         const user = userEl ? userEl.innerText.trim() : '';
-        if (!user || !isLyUserName(user)) return;
+        const isLyUser = (n) => LY_USERS.some(h => (n || '').includes(h));
+        const isLyLine = (line) => {
+          const l = String(line || '');
+          if (user && l === user) return true;
+          return LY_USERS.some(h => l === h || l.startsWith(h));
+        };
+        if (!user || !isLyUser(user)) return;
         const lines = (el.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
         let time = '';
         const details = [];
         for (const line of lines) {
           if (line.length <= 2 && !/\d/.test(line)) continue;
-          if (lineIsLyUser(line, user)) continue;
+          if (isLyLine(line)) continue;
           if (/^\d{4}-\d{2}-\d{2}/.test(line) && !time) { time = line; continue; }
           if (line.indexOf('添加评论') === 0) continue;
           details.push(line);
         }
-        if (details.length) longYanChanges.push({ time, detail: details.join('；') });
+        if (details.length) longYanChanges.push({ time, detail: details.join('；'), user: user.trim() });
       });
       let type = 'BUG';
       const t = document.title || '';
@@ -1441,7 +1472,7 @@ async function validateBugs(onLogCallback, options = {}) {
       const empty = !f.v || f.v.trim() === '' || f.v === '-';
       if (!empty) continue;
       if (lySkip(lyFields, f.n)) {
-        reqDetails.push('⏭️ ' + f.n + ' 被龙燕修改，跳过必填检查');
+        reqDetails.push('⏭️ ' + f.n + ' 被' + lyWho(lyFields, f.n) + '修改，跳过必填检查');
       } else {
         reqDetails.push('❌ ' + f.n + ' 为空');
       }
@@ -1458,10 +1489,10 @@ async function validateBugs(onLogCallback, options = {}) {
     const personDetails = [];
     if (lyFields.size) {
       const showList = formatLyFieldList(lyFields);
-      if (showList) personDetails.push('🔸 龙燕修改字段: ' + showList);
+      if (showList) personDetails.push('🔸 人工修改字段: ' + showList);
     }
     if (lySkip(lyFields, '负责人')) {
-      personDetails.push('⏭️ 负责人已被龙燕修改，跳过校验（当前: ' + (bug.responsible || '空') + '）');
+      personDetails.push('⏭️ 负责人已被' + lyWho(lyFields, '负责人') + '修改，跳过校验（当前: ' + (bug.responsible || '空') + '）');
     } else if (bug.responsible && !bug.responsible.includes(expectedResponsible)) {
       personDetails.push('❌ 负责人应为"' + expectedResponsible + '"，当前: ' + bug.responsible);
     } else if (bug.responsible) {
@@ -1470,7 +1501,7 @@ async function validateBugs(onLogCallback, options = {}) {
     if (!expectedTester) {
       personDetails.push('⏭️ Tester 未设置期望值，跳过校验');
     } else if (lySkip(lyFields, 'Tester', '测试人员')) {
-      personDetails.push('⏭️ Tester已被龙燕修改，跳过校验（当前: ' + (bug.tester || '空') + '）');
+      personDetails.push('⏭️ Tester已被' + lyWho(lyFields, 'Tester', '测试人员') + '修改，跳过校验（当前: ' + (bug.tester || '空') + '）');
     } else if (bug.tester && !bug.tester.includes(expectedTester)) {
       personDetails.push('❌ Tester应为"' + expectedTester + '"，当前: ' + bug.tester);
     } else if (bug.tester) {
@@ -1499,19 +1530,11 @@ async function validateBugs(onLogCallback, options = {}) {
     versionDetails.push('📋 发现BUG版本: ' + (bug.foundVersions || '未填写'));
     versionDetails.push('📋 Release Phase: ' + (bug.releasePhase || '未填写'));
     versionDetails.push('📋 版本(Version): ' + (bug.version || '未填写'));
-    if (lyFields.size) {
-      const showList = formatLyFieldList(lyFields);
-      if (showList) versionDetails.push('📋 龙燕修改: ' + showList);
-      (bug.longYanChanges || []).forEach(c => {
-        const line = formatLyChangeLine(c);
-        if (line) versionDetails.push('   · ' + line);
-      });
-    }
     versionDetails.push('---');
 
     if (!bug.foundVersions) {
       if (skipFoundVer) {
-        versionDetails.push('⏭️ 发现BUG版本被龙燕修改，跳过填写检查');
+        versionDetails.push('⏭️ 发现BUG版本被' + lyWho(lyFields, '发现BUG版本', '发现版本') + '修改，跳过填写检查');
       } else {
         versionDetails.push('❌ 发现BUG版本未填写');
       }
@@ -1519,7 +1542,7 @@ async function validateBugs(onLogCallback, options = {}) {
       const baseVer = bug.foundVersions.match(/(1\.\d+\.\d+)/);
       if (!baseVer) {
         if (skipFoundVer) {
-          versionDetails.push('⏭️ 发现BUG版本被龙燕修改，跳过格式检查（当前: ' + bug.foundVersions + '）');
+          versionDetails.push('⏭️ 发现BUG版本被' + lyWho(lyFields, '发现BUG版本', '发现版本') + '修改，跳过格式检查（当前: ' + bug.foundVersions + '）');
         } else {
           versionDetails.push('❌ 未解析到 1.x.y 格式版本号');
         }
@@ -1546,7 +1569,7 @@ async function validateBugs(onLogCallback, options = {}) {
         };
         if (expectRP) {
           if (skipReleasePhase) {
-            versionDetails.push('⏭️ Release Phase 被龙燕修改，跳过校验（当前: ' + (bug.releasePhase || '空') + '）');
+            versionDetails.push('⏭️ Release Phase 被' + lyWho(lyFields, 'Release Phase', 'ReleasePhase') + '修改，跳过校验（当前: ' + (bug.releasePhase || '空') + '）');
           } else if (bug.releasePhase.toLowerCase() !== expectRP) {
             versionDetails.push('❌ 控制器版本对应 Release Phase 应为"' + rpLabel[expectRP] + '"，当前: ' + bug.releasePhase);
           } else {
@@ -1556,14 +1579,14 @@ async function validateBugs(onLogCallback, options = {}) {
           if (vt === 'feature') {
             const bVer = bug.ctrlVersion.match(/(1\.\d+\.\d+)/)?.[1];
             if (skipVersion) {
-              versionDetails.push('⏭️ 版本(Version) 被龙燕修改，跳过校验（当前: ' + (bug.version || '空') + '）');
+              versionDetails.push('⏭️ 版本(Version) 被' + lyWho(lyFields, '版本', 'Version') + '修改，跳过校验（当前: ' + (bug.version || '空') + '）');
             } else if (bVer) {
               if (bug.version !== bVer) versionDetails.push('❌ 版本应为"' + bVer + '"，当前: ' + bug.version);
               else versionDetails.push('✓ 版本 = ' + bVer + ' ✓');
             }
           } else if (vt === 'stable') {
             if (skipVersion) {
-              versionDetails.push('⏭️ 版本(Version) 被龙燕修改，跳过校验（当前: ' + (bug.version || '空') + '）');
+              versionDetails.push('⏭️ 版本(Version) 被' + lyWho(lyFields, '版本', 'Version') + '修改，跳过校验（当前: ' + (bug.version || '空') + '）');
             } else if (bug.version.toLowerCase() !== 'bug backlog') {
               versionDetails.push('❌ 版本应为"Bug backlog"，当前: ' + bug.version);
             } else {
@@ -1571,7 +1594,7 @@ async function validateBugs(onLogCallback, options = {}) {
             }
           } else if (vt === 'rc' || vt === 'pre' || vt === 'alpha' || vt === 'beta') {
             if (skipVersion) {
-              versionDetails.push('⏭️ 版本(Version) 被龙燕修改，跳过校验（当前: ' + (bug.version || '空') + '）');
+              versionDetails.push('⏭️ 版本(Version) 被' + lyWho(lyFields, '版本', 'Version') + '修改，跳过校验（当前: ' + (bug.version || '空') + '）');
             } else {
               if (bug.version.toLowerCase() !== 'bug backlog') versionDetails.push('❌ 版本应为"Bug backlog"，当前: ' + bug.version);
               else versionDetails.push('✓ 版本 = Bug backlog ✓');
@@ -1583,7 +1606,7 @@ async function validateBugs(onLogCallback, options = {}) {
 
     // 发现BUG版本 覆盖/排除（龙燕改过发现BUG版本则整段跳过）
     if (skipFoundVer) {
-      versionDetails.push('⏭️ 发现BUG版本覆盖/排除检查已被龙燕修改跳过');
+      versionDetails.push('⏭️ 发现BUG版本覆盖/排除检查已被' + lyWho(lyFields, '发现BUG版本', '发现版本') + '修改跳过');
     } else {
       const VER_ORDER = versionOrder;
       const ctrlBaseVer = bug.ctrlVersion ? bug.ctrlVersion.match(/CRA9-?(1\.\d+\.\d+)/) : null;
@@ -1631,7 +1654,7 @@ async function validateBugs(onLogCallback, options = {}) {
     const versionHasFail = versionDetails.some(d => d.startsWith('❌'));
     if (!versionHasFail) {
       const hasSkip = versionDetails.some(d => d.startsWith('⏭️') || d.startsWith('🔸'));
-      versionDetails.push(hasSkip ? '✅ 版本迭代检查通过（含龙燕跳过项）' : '✅ 版本迭代检查通过');
+      versionDetails.push(hasSkip ? '✅ 版本迭代检查通过（含人工修改跳过项）' : '✅ 版本迭代检查通过');
     }
     checks.push({ name: '版本', pass: !versionHasFail, details: versionDetails });
     bug.longYanFixed = lyFields.size > 0;
@@ -1639,7 +1662,7 @@ async function validateBugs(onLogCallback, options = {}) {
     // === 规则4: 模块最末级（龙燕改过模块则跳过）===
     const moduleDetails = [];
     if (lySkip(lyFields, '模块')) {
-      moduleDetails.push('⏭️ 模块已被龙燕修改，跳过最末级校验（当前: ' + (bug.module || '空') + '）');
+      moduleDetails.push('⏭️ 模块已被' + lyWho(lyFields, '模块') + '修改，跳过最末级校验（当前: ' + (bug.module || '空') + '）');
     } else if (bug.module) {
       const result = checkModule(bug.module);
       moduleDetails.push(result.detail);
@@ -1856,7 +1879,9 @@ function buildLastReportHtml(data) {
       const label = key === '必填项' ? '' : '【' + key + '】<br>';
       const colored = check.details.map(d => {
         const e = escapeHtml(d);
-        if (d.startsWith('❌') || d.startsWith('⚠️')) return '<span style="color:#d00;font-weight:bold">' + e + '</span>';
+        if (d.startsWith('❌') || d.startsWith('⚠️') || d.includes('龙燕') || d.includes('黄贵良') ||
+            (d.startsWith('⏭️') && d.includes('修改')))
+          return '<span style="color:#d00;font-weight:bold">' + e + '</span>';
         if (d.startsWith('✓') || d.startsWith('⏭️')) return '<span style="color:#0a0">' + e + '</span>';
         return e;
       });
@@ -1867,7 +1892,8 @@ function buildLastReportHtml(data) {
     if (vc) {
       verHtml = vc.details.map(d => {
         const e = escapeHtml(d);
-        if (d.includes('龙燕') || d.startsWith('❌') || d.startsWith('🔄'))
+        if (d.includes('龙燕') || d.includes('黄贵良') || d.startsWith('❌') || d.startsWith('🔄') ||
+            (d.startsWith('⏭️') && d.includes('修改')))
           return '<span style="color:#d00;font-weight:bold">' + e + '</span>';
         if (d.startsWith('✓') || d.startsWith('✅') || d.startsWith('📋') || d.startsWith('⏭️') || d.includes('通过'))
           return '<span style="color:#0a0">' + e + '</span>';
