@@ -692,10 +692,14 @@ function renderValidationResult(result, opts) {
   let rpCountAll = 0, verCountAll = 0, modCountAll = 0, reqCountAll = 0, ctrlCountAll = 0, craftCountAll = 0;
 
   (result.bugs || []).sort((a, b) => {
+    // 1) 校验失败置顶  2) 被龙燕/黄贵良改过  3) 其余
     const aFail = a.checks && a.checks.every(c => c.pass) ? 0 : 1;
     const bFail = b.checks && b.checks.every(c => c.pass) ? 0 : 1;
     if (aFail !== bFail) return bFail - aFail;
-    return ((b.hasLongYan ? 1 : 0) - (a.hasLongYan ? 1 : 0));
+    const aMod = a.hasLongYan ? 1 : 0;
+    const bMod = b.hasLongYan ? 1 : 0;
+    if (aMod !== bMod) return bMod - aMod;
+    return (b.id || 0) - (a.id || 0);
   });
 
   for (const bug of result.bugs || []) {
@@ -729,8 +733,9 @@ function renderValidationResult(result, opts) {
       if (!check) continue;
       const label = key === '必填项' ? '' : '【' + key + '】<br>';
       const colored = check.details.map(d => {
-        if (d.startsWith('❌') || d.startsWith('⚠️') || d.includes('龙燕') || d.includes('黄贵良') ||
-            (d.startsWith('⏭️') && d.includes('修改')))
+        const isLyEditLine = (d.startsWith('⏭️') && (d.includes('龙燕') || d.includes('黄贵良'))) ||
+          ((d.includes('龙燕') || d.includes('黄贵良')) && d.includes('修改'));
+        if (d.startsWith('❌') || d.startsWith('⚠️') || isLyEditLine)
           return '<span style="color:#d00;font-weight:bold">' + d + '</span>';
         if (d.startsWith('✓') || d.startsWith('⏭️')) return '<span style="color:#0a0">' + d + '</span>';
         return d;
@@ -742,8 +747,9 @@ function renderValidationResult(result, opts) {
     const versionCheck = bug.checks.find(c => c.name === '版本');
     if (versionCheck) {
       const styledDetails = versionCheck.details.map(d => {
-        if (d.includes('龙燕') || d.includes('黄贵良') || d.startsWith('❌') || d.startsWith('🔄') ||
-            (d.startsWith('⏭️') && d.includes('修改')))
+        const isLyEditLine = (d.startsWith('⏭️') && (d.includes('龙燕') || d.includes('黄贵良'))) ||
+          ((d.includes('龙燕') || d.includes('黄贵良')) && d.includes('修改'));
+        if (isLyEditLine || d.startsWith('❌') || d.startsWith('🔄'))
           return '<span style="color:#d00;font-weight:bold">' + d + '</span>';
         if (d.startsWith('✓') || d.startsWith('✅') || d.startsWith('📋') || d.startsWith('⏭️') || d.includes('通过'))
           return '<span style="color:#0a0">' + d + '</span>';
@@ -923,6 +929,17 @@ function lineIsLyUser(line, user) {
 function isHiddenLyField(name) {
   const n = String(name || '');
   return LY_DISPLAY_HIDE.some(h => n === h || n.startsWith(h));
+}
+
+// 结果行里会标红的「被龙燕/黄贵良修改、跳过校验」行（置顶条件与此一致）
+function isLyEditDetailLine(d) {
+  const s = String(d || '');
+  return (s.startsWith('⏭️') && (s.includes('龙燕') || s.includes('黄贵良'))) ||
+    ((s.includes('龙燕') || s.includes('黄贵良')) && s.includes('修改'));
+}
+
+function checksHaveLyEditSkip(checks) {
+  return (checks || []).some(c => (c.details || []).some(isLyEditDetailLine));
 }
 
 function parseLyFieldName(seg) {
@@ -1210,7 +1227,9 @@ async function validateBugs(onLogCallback, options = {}) {
     bug.version = parts.attrs['版本'] || '';
     bug.type = parts.type || 'BUG';
     bug.longYanChanges = parts.longYanChanges || [];
-    bug.hasLongYan = bug.longYanChanges.length > 0 || rawHasLyUser(parts.raw);
+    // 仅当 journal 里确有龙燕/黄贵良改字段时才算「被修改过」
+    // （不要用全文含「黄贵良」判断，否则负责人=黄贵良 的单会全被标成修改过）
+    bug.hasLongYan = bug.longYanChanges.length > 0;
     return bug;
   }
 
@@ -1487,10 +1506,6 @@ async function validateBugs(onLogCallback, options = {}) {
     
     // === 规则2: 人员（龙燕改过的字段跳过）===
     const personDetails = [];
-    if (lyFields.size) {
-      const showList = formatLyFieldList(lyFields);
-      if (showList) personDetails.push('🔸 人工修改字段: ' + showList);
-    }
     if (lySkip(lyFields, '负责人')) {
       personDetails.push('⏭️ 负责人已被' + lyWho(lyFields, '负责人') + '修改，跳过校验（当前: ' + (bug.responsible || '空') + '）');
     } else if (bug.responsible && !bug.responsible.includes(expectedResponsible)) {
@@ -1677,17 +1692,17 @@ async function validateBugs(onLogCallback, options = {}) {
     });
     const craftDetails = [];
     const allText = (bug.reproduceSteps + ' ' + bug.phenomenon + ' ' + bug.reproduceCondition + ' ' + bug.description).substring(0, 3000);
-    const hasWeld = /(激光|弧焊|焊接)/.test(allText);
-    
+    const hasWeld = /(激光|弧焊|焊接|切割|点焊|折弯|中厚板|冲压|码垛|搬运|熔覆)/.test(allText);
+
     if (hasWeld) {
       const craftVal = bug.attrs['关联工艺'] || '';
       if (craftVal && craftVal !== '-') {
-        craftDetails.push('✓ 含焊接关键词，关联工艺已填: ' + craftVal);
+        craftDetails.push('✓ 含工艺关键词，关联工艺已填: ' + craftVal);
       } else {
-        craftDetails.push('❌ BUG含"激光/弧焊/焊接"关键词，但关联工艺为空');
+        craftDetails.push('❌ BUG含工艺关键词（激光/弧焊/焊接/切割/点焊/折弯/中厚板/冲压/码垛/搬运/熔覆），但关联工艺为空');
       }
     } else {
-      craftDetails.push('✓ 不含焊接关键词，无需关联工艺');
+      craftDetails.push('✓ 不含工艺关键词，无需关联工艺');
     }
     checks.push({ name: '关联工艺', pass: craftDetails.every(d => d.includes('✓')), details: craftDetails });
     
@@ -1695,7 +1710,8 @@ async function validateBugs(onLogCallback, options = {}) {
       id: bug.id,
       subject: bug.subject,
       type: bug.type,
-      hasLongYan: bug.longYanFixed || false,
+      // 仅结果里出现标红跳过行才算「被修改过」（用于置顶）
+      hasLongYan: checksHaveLyEditSkip(checks),
       longYanChanges: bug.longYanChanges || [],
       checks
     });
@@ -1868,7 +1884,16 @@ function escapeHtml(s) {
 }
 
 function buildLastReportHtml(data) {
-  const bugs = data.bugs || [];
+  const bugs = (data.bugs || []).slice().sort((a, b) => {
+    // 1) 失败置顶  2) 被龙燕/黄贵良改过  3) 其余
+    const aFail = a.checks && a.checks.every(c => c.pass) ? 0 : 1;
+    const bFail = b.checks && b.checks.every(c => c.pass) ? 0 : 1;
+    if (aFail !== bFail) return bFail - aFail;
+    const aMod = a.hasLongYan ? 1 : 0;
+    const bMod = b.hasLongYan ? 1 : 0;
+    if (aMod !== bMod) return bMod - aMod;
+    return (b.id || 0) - (a.id || 0);
+  });
   const opOrigin = data.opOrigin || OP_DEFAULT_BASE;
   const rows = bugs.map((bug, idx) => {
     const allPass = bug.checks && bug.checks.every(c => c.pass);
@@ -1879,8 +1904,9 @@ function buildLastReportHtml(data) {
       const label = key === '必填项' ? '' : '【' + key + '】<br>';
       const colored = check.details.map(d => {
         const e = escapeHtml(d);
-        if (d.startsWith('❌') || d.startsWith('⚠️') || d.includes('龙燕') || d.includes('黄贵良') ||
-            (d.startsWith('⏭️') && d.includes('修改')))
+        const isLyEditLine = (d.startsWith('⏭️') && (d.includes('龙燕') || d.includes('黄贵良'))) ||
+          ((d.includes('龙燕') || d.includes('黄贵良')) && d.includes('修改'));
+        if (d.startsWith('❌') || d.startsWith('⚠️') || isLyEditLine)
           return '<span style="color:#d00;font-weight:bold">' + e + '</span>';
         if (d.startsWith('✓') || d.startsWith('⏭️')) return '<span style="color:#0a0">' + e + '</span>';
         return e;
@@ -1892,8 +1918,9 @@ function buildLastReportHtml(data) {
     if (vc) {
       verHtml = vc.details.map(d => {
         const e = escapeHtml(d);
-        if (d.includes('龙燕') || d.includes('黄贵良') || d.startsWith('❌') || d.startsWith('🔄') ||
-            (d.startsWith('⏭️') && d.includes('修改')))
+        const isLyEditLine = (d.startsWith('⏭️') && (d.includes('龙燕') || d.includes('黄贵良'))) ||
+          ((d.includes('龙燕') || d.includes('黄贵良')) && d.includes('修改'));
+        if (isLyEditLine || d.startsWith('❌') || d.startsWith('🔄'))
           return '<span style="color:#d00;font-weight:bold">' + e + '</span>';
         if (d.startsWith('✓') || d.startsWith('✅') || d.startsWith('📋') || d.startsWith('⏭️') || d.includes('通过'))
           return '<span style="color:#0a0">' + e + '</span>';
