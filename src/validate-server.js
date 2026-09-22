@@ -896,8 +896,26 @@ function extractCtrlVersion(desc) {
   return m ? m[1].trim() : '';
 }
 
-// 不在结果中展示的龙燕修改字段（仍会参与跳过，只是不展示明细）
+// 不在结果中展示的修改字段（仍会参与跳过，只是不展示明细）
 const LY_DISPLAY_HIDE = ['受理人', 'Dev'];
+// 触发「改过即跳过」的人员：龙燕 或 黄贵良（输出文案仍写「龙燕」）
+const LY_USER_NAMES = ['龙燕', '黄贵良'];
+
+function isLyUserName(name) {
+  const n = String(name || '');
+  return LY_USER_NAMES.some(h => n.includes(h));
+}
+
+function rawHasLyUser(raw) {
+  const s = String(raw || '');
+  return LY_USER_NAMES.some(h => s.includes(h));
+}
+
+function lineIsLyUser(line, user) {
+  const l = String(line || '');
+  if (user && l === user) return true;
+  return LY_USER_NAMES.some(h => l === h || l.startsWith(h));
+}
 
 function isHiddenLyField(name) {
   const n = String(name || '');
@@ -1168,7 +1186,7 @@ async function validateBugs(onLogCallback, options = {}) {
     bug.version = parts.attrs['版本'] || '';
     bug.type = parts.type || 'BUG';
     bug.longYanChanges = parts.longYanChanges || [];
-    bug.hasLongYan = bug.longYanChanges.length > 0 || (parts.raw || '').includes('龙燕');
+    bug.hasLongYan = bug.longYanChanges.length > 0 || rawHasLyUser(parts.raw);
     return bug;
   }
 
@@ -1202,13 +1220,13 @@ async function validateBugs(onLogCallback, options = {}) {
       document.querySelectorAll('.work-packages-activities-tab-journals-item-component').forEach(el => {
         const userEl = el.querySelector('.work-packages-activities-tab-journals-item-component-details--user-name');
         const user = userEl ? userEl.innerText.trim() : '';
-        if (!user || !user.includes('龙燕')) return;
+        if (!user || !isLyUserName(user)) return;
         const lines = (el.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
         let time = '';
         const details = [];
         for (const line of lines) {
           if (line.length <= 2 && !/\d/.test(line)) continue;
-          if (line === user || line.startsWith('龙燕')) continue;
+          if (lineIsLyUser(line, user)) continue;
           if (/^\d{4}-\d{2}-\d{2}/.test(line) && !time) { time = line; continue; }
           if (line.indexOf('添加评论') === 0) continue;
           details.push(line);
