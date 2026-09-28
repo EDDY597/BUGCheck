@@ -177,43 +177,85 @@ function getAllLeafModules() {
 
 function isLeafModule(name) {
   const leaves = getAllLeafModules();
-  return leaves.includes(name);
+  const n = String(name || '').trim();
+  if (!n) return false;
+  return leaves.includes(n) || leaves.includes(stripParenthetical(n));
+}
+
+function stripParenthetical(s) {
+  if (!s) return '';
+  return String(s).replace(/[（(][^）)]*[）)]$/, '').trim();
+}
+
+// 已知规格名（含带 / 的单名，如 输入/输出、TCP/IP、远程/预约）
+function collectKnownNames() {
+  const names = new Set();
+  const add = (n) => {
+    if (!n) return;
+    const s = String(n).trim();
+    names.add(s);
+    const stripped = stripParenthetical(s);
+    if (stripped) names.add(stripped);
+  };
+  for (const [l1, data] of Object.entries(moduleHierarchy)) {
+    add(l1);
+    (data.features || []).forEach(add);
+    (data.subFeatures || []).forEach(add);
+    if (data.children) {
+      for (const [l2, l3List] of Object.entries(data.children)) {
+        add(l2);
+        (l3List || []).forEach(add);
+      }
+    }
+  }
+  return names;
+}
+
+const KNOWN_MODULE_NAMES = collectKnownNames();
+
+// 从输入里解析出规格名：
+// 1) 整名命中（含带 / 的单名） 2) 按路径段从长到短拼 / 匹配 3) 兜底取末段
+function resolveModuleName(path) {
+  if (!path) return '';
+  const raw = String(path).trim();
+  const stripped = stripParenthetical(raw);
+  if (KNOWN_MODULE_NAMES.has(raw)) return raw;
+  if (stripped && KNOWN_MODULE_NAMES.has(stripped)) return stripped;
+
+  const parts = raw.split('/').map(p => p.trim()).filter(Boolean);
+  for (let i = 0; i < parts.length; i++) {
+    const cand = parts.slice(i).join('/');
+    if (KNOWN_MODULE_NAMES.has(cand)) return cand;
+    const candStripped = stripParenthetical(cand);
+    if (candStripped && KNOWN_MODULE_NAMES.has(candStripped)) return candStripped;
+  }
+  return stripped || parts[parts.length - 1] || '';
 }
 
 function getLastSegment(path) {
-  if (!path) return '';
-  const parts = path.split('/');
-  let last = parts[parts.length - 1].trim();
-  // 去掉括号后缀，如"送丝控制（R4）"→"送丝控制"
-  last = last.replace(/[（(][^）)]*[）)]$/, '').trim();
-  return last;
-}
-
-// 用于校验详情展示：去掉括号后缀（供 isLeafModule/checkModule 自动调用）
-function stripParenthetical(s) {
-  if (!s) return '';
-  return s.replace(/[（(][^）)]*[）)]$/, '').trim();
+  return resolveModuleName(path);
 }
 
 function checkModule(path) {
   if (!path) return { pass: false, detail: '❌ 模块未填写' };
 
-  const lastSeg = getLastSegment(path);
+  const lastSeg = resolveModuleName(path);
 
   if (isLeafModule(lastSeg)) {
     return { pass: true, detail: `✓ 模块"${lastSeg}"是最末级规格` };
   }
 
   for (const [l1, data] of Object.entries(moduleHierarchy)) {
-    if (lastSeg === l1) {
+    if (lastSeg === l1 || stripParenthetical(lastSeg) === l1) {
       const options = [];
       if (data.features) options.push(...data.features);
       if (data.children) Object.keys(data.children).forEach(k => options.push(k + '(有子级)'));
       if (data.subFeatures) options.push(...data.subFeatures);
       return { pass: false, detail: `❌ "${lastSeg}"是父级，可选: ${options.slice(0,5).join(', ')}...` };
     }
-    if (data.children && Object.keys(data.children).includes(lastSeg)) {
-      const subs = data.children[lastSeg];
+    if (data.children && Object.keys(data.children).some(k => k === lastSeg || stripParenthetical(lastSeg) === k)) {
+      const key = Object.keys(data.children).find(k => k === lastSeg || stripParenthetical(lastSeg) === k);
+      const subs = data.children[key];
       return { pass: false, detail: `❌ "${lastSeg}"有子级，应选: ${subs.slice(0,5).join(', ')}...` };
     }
   }

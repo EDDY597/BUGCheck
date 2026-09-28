@@ -111,38 +111,50 @@ function saveServerConfig(cfg) {
   } catch {}
 }
 
-function normalizeListUrl(input) {
-  let u = String(input || '').trim();
-  if (!u) return OP_DEFAULT_BASE + '/' + DEFAULT_LIST_QUERY;
-  if (/^https?:\/\//i.test(u)) {
-    // 完整 URL：若仍是默认 query_id=4351 且未带 query_props，补上标准列/筛选
-    try {
-      const parsed = new URL(u);
-      if (parsed.searchParams.get('query_id') === '4351' && !parsed.searchParams.get('query_props')) {
-        parsed.searchParams.set('query_props', buildDefaultQueryProps());
-        return parsed.toString();
-      }
-    } catch {}
-    return u;
+// 列表 URL 原样使用（以用户/查询保存的过滤条件为准）。
+// 仅去掉 query_props 里的 type 过滤，避免旧配置只拉 7/37 而漏掉「建议」。
+function removeTypeFiltersFromUrl(urlString) {
+  try {
+    const u = new URL(urlString, OP_DEFAULT_BASE + '/');
+    const raw = u.searchParams.get('query_props');
+    if (!raw) return urlString;
+    let props = JSON.parse(raw);
+    if (typeof props === 'string') props = JSON.parse(props);
+    if (!props || typeof props !== 'object') return urlString;
+    if (Array.isArray(props.f)) {
+      const next = props.f.filter(f => !f || f.n !== 'type');
+      if (next.length === props.f.length) return urlString;
+      props.f = next;
+    }
+    u.searchParams.set('query_props', JSON.stringify(props));
+    return u.toString();
+  } catch {
+    return urlString;
   }
-  if (u.startsWith('/')) u = u.slice(1);
-  const full = OP_DEFAULT_BASE + '/' + u;
-  // 相对路径且为默认 query，补上标准列/筛选
-  if (/query_id=4351/.test(u) && !/query_props=/.test(u)) {
-    return full + '&query_props=' + buildDefaultQueryProps();
-  }
-  return full;
 }
 
-function buildDefaultQueryProps() {
-  return encodeURIComponent(JSON.stringify({
-    c: ["type","id","subject","status","customField34","assignee","version","customField60","customField32","createdAt","customField68","customField53","responsible","customField52"],
-    hi: true, g: "", is: true, tv: false, hl: "inline",
-    hla: ["status","priority","dueDate"],
-    t: "createdAt:desc,id:asc",
-    f: [{n:"author",o:"=",v:["me"]},{n:"type",o:"=",v:["7","37"]},{n:"createdAt",o:"w",v:["8"]}],
-    ts: "PT0S", pp: 50, pa: 1
-  }));
+function normalizeListUrl(input) {
+  let u = String(input || '').trim();
+  if (!u) u = DEFAULT_LIST_QUERY;
+  if (!/^https?:\/\//i.test(u)) {
+    if (u.startsWith('/')) u = u.slice(1);
+    u = OP_DEFAULT_BASE + '/' + u;
+  }
+  return removeTypeFiltersFromUrl(u);
+}
+
+// 类型识别：显式类型名优先，避免标题里出现「缺陷/Bug」把需求误判成 BUG
+function classifyWpType(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (/^(建议|Suggestion|Improvement)$/i.test(s)) return '建议';
+  if (/^(需求|Requirement|Feature|User Story|Story)$/i.test(s)) return '需求';
+  if (/^(文档编写|文档|Documentation|Docs?)$/i.test(s)) return '文档编写';
+  if (/^(Bug|BUG|缺陷|Defect|Issue|Fault)$/i.test(s)) return 'BUG';
+  if (/文档编写|Documentation/i.test(s)) return '文档编写';
+  if (/建议|Suggestion/i.test(s)) return '建议';
+  if (/\b需求\b|Requirement/i.test(s)) return '需求';
+  return '';
 }
 
 function extractOrigin(url) {
@@ -703,7 +715,8 @@ function renderValidationResult(result, opts) {
   });
 
   for (const bug of result.bugs || []) {
-    if (bug.type === '需求') continue;
+    // 结果页只展示 BUG / 建议
+    if (bug.type !== 'BUG' && bug.type !== '建议') continue;
     displayCount++;
     if (!opts.silentLogs) log('校验 BUG #' + bug.id + '...');
     const allPass = bug.checks.every(c => c.pass);
@@ -1161,25 +1174,62 @@ async function validateBugs(onLogCallback, options = {}) {
   // 获取BUG列表（使用设置中的列表页 URL）
   await page.goto(listUrl, { waitUntil: 'networkidle', timeout: 20000 });
 
-  // 提取BUG ID（SPA异步渲染，networkidle可能过早触发 → 等待+重试）
-  let bugIds = [];
+  // 提取工作项 ID + 列表类型提示（SPA异步渲染，networkidle可能过早触发 → 等待+重试）
+  let bugItems = [];
   for (let attempt = 0; attempt < 6; attempt++) {
     try {
       await page.waitForSelector('a[href*="/work_packages/"]', { timeout: 5000 });
     } catch {}
-    bugIds = await page.evaluate(() => {
-      const ids = new Set();
-      document.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
-        const m = a.href.match(/\/work_packages\/(\d+)/);
-        if (m) ids.add(parseInt(m[1]));
+    bugItems = await page.evaluate(() => {
+      const map = new Map();
+      const rows = document.querySelectorAll('tr, .wp-table--row');
+      const add = (id, typeHint) => {
+        if (!id) return;
+        const prev = map.get(id) || { id, typeHint: '' };
+        if (!prev.typeHint && typeHint) prev.typeHint = typeHint;
+        map.set(id, prev);
+      };
+      rows.forEach(row => {
+        let id = null;
+        row.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
+          const m = a.href.match(/\/work_packages\/(\d+)/);
+          if (m) id = parseInt(m[1], 10);
+        });
+        if (!id) return;
+        // 类型列 / 图标 title
+        const hints = [];
+        row.querySelectorAll('[title]').forEach(el => {
+          const t = (el.getAttribute('title') || '').trim();
+          if (t && t.length <= 24) hints.push(t);
+        });
+        row.querySelectorAll('td, .wp-table--cell').forEach(td => {
+          const t = (td.innerText || '').trim();
+          if (t && t.length <= 24) hints.push(t);
+        });
+        let typeHint = '';
+        for (const h of hints) {
+          if (/建议|Suggestion|需求|Requirement|文档编写|Documentation|Bug|BUG|缺陷|Defect/i.test(h)) {
+            typeHint = h;
+            break;
+          }
+        }
+        add(id, typeHint);
       });
-      return Array.from(ids);
+      if (!map.size) {
+        document.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
+          const m = a.href.match(/\/work_packages\/(\d+)/);
+          if (m) add(parseInt(m[1], 10), '');
+        });
+      }
+      return Array.from(map.values());
     });
-    if (bugIds.length > 0) break;
+    if (bugItems.length > 0) break;
     await page.waitForTimeout(1500);
   }
-  
-  log('找到 ' + bugIds.length + ' 个工作项');
+  const bugIds = bugItems.map(x => x.id);
+  const typeHintById = new Map(bugItems.map(x => [x.id, x.typeHint || '']));
+  const sugPreview = bugItems.filter(x => /建议|Suggestion/i.test(x.typeHint || '')).length;
+  log('找到 ' + bugIds.length + ' 个工作项' + (sugPreview ? '（其中建议类约 ' + sugPreview + ' 个）' : ''));
 
 
   // 获取详情：只抠页面。等「标题有字」即可，空页再整页刷新重抠一次
@@ -1226,6 +1276,7 @@ async function validateBugs(onLogCallback, options = {}) {
     bug.releasePhase = parts.attrs['Release Phase'] || '';
     bug.version = parts.attrs['版本'] || '';
     bug.type = parts.type || 'BUG';
+    bug.fetchFailed = !!parts.fetchFailed;
     bug.longYanChanges = parts.longYanChanges || [];
     // 仅当 journal 里确有龙燕/黄贵良改字段时才算「被修改过」
     // （不要用全文含「黄贵良」判断，否则负责人=黄贵良 的单会全被标成修改过）
@@ -1233,8 +1284,8 @@ async function validateBugs(onLogCallback, options = {}) {
     return bug;
   }
 
-  async function scrapeOnce(tab) {
-    return await tab.evaluate(() => {
+  async function scrapeOnce(tab, listTypeHint) {
+    return await tab.evaluate((hint) => {
       const attrs = {};
       document.querySelectorAll('.wp-attribute-group--attribute').forEach(el => {
         const keyEl = el.querySelector('.wp-attribute-group--attribute-key');
@@ -1283,10 +1334,53 @@ async function validateBugs(onLogCallback, options = {}) {
         }
         if (details.length) longYanChanges.push({ time, detail: details.join('；'), user: user.trim() });
       });
-      let type = 'BUG';
-      const t = document.title || '';
-      if (/建议|Suggestion/i.test(t)) type = '建议';
-      else if (/需求|Requirement|Feature/i.test(t)) type = '需求';
+      // 类型识别：角标/属性优先，标题仅作兜底（标题含「缺陷」不能当 BUG）
+      function classify(raw) {
+        const s = String(raw || '').trim();
+        if (!s) return '';
+        if (/^(建议|Suggestion|Improvement)$/i.test(s)) return '建议';
+        if (/^(需求|Requirement|Feature|User Story|Story)$/i.test(s)) return '需求';
+        if (/^(文档编写|文档|Documentation|Docs?)$/i.test(s)) return '文档编写';
+        if (/^(Bug|BUG|缺陷|Defect|Issue|Fault)$/i.test(s)) return 'BUG';
+        if (/文档编写|Documentation/i.test(s)) return '文档编写';
+        if (/建议|Suggestion/i.test(s)) return '建议';
+        if (/\b需求\b|Requirement/i.test(s)) return '需求';
+        return '';
+      }
+      const typeCandidates = [];
+      document.querySelectorAll(
+        '.wp-type--status, .work-packages--subject-header--type, [data-test-selector="op-wp-single-type"], ' +
+        '.wp-breadcrumb--item, .work-packages--details--type, #type'
+      ).forEach(el => {
+        const t = (el.innerText || el.textContent || '').trim();
+        if (t && t.length <= 32) typeCandidates.push(t);
+      });
+      document.querySelectorAll('.wp-attribute-group--attribute').forEach(el => {
+        const keyEl = el.querySelector('.wp-attribute-group--attribute-key');
+        const key = keyEl ? (keyEl.innerText || '').replace(/\s*\*+\s*$/, '').trim() : '';
+        if (!/^(类型|Type)$/i.test(key)) return;
+        const valEl = el.querySelector('.wp-attribute-group--attribute-value-container');
+        const v = valEl ? (valEl.innerText || '').trim() : '';
+        if (v) typeCandidates.push(v);
+      });
+      document.querySelectorAll('[title]').forEach(el => {
+        const t = (el.getAttribute('title') || '').trim();
+        if (t && t.length <= 24 && /^(建议|Suggestion|需求|Requirement|文档编写|Documentation|Bug|BUG|缺陷|Defect)$/i.test(t)) {
+          typeCandidates.push(t);
+        }
+      });
+      let type = '';
+      // 角标/类型属性已收集在前，命中即用；不要用 document.title 抢判
+      for (const c of typeCandidates) {
+        const hit = classify(c);
+        if (hit) { type = hit; break; }
+      }
+      if (!type && hint) type = classify(hint);
+      if (!type) {
+        // 标题兜底：仅识别建议/需求/文档编写，避免标题里的「缺陷/Bug」误判
+        const t = classify(document.title || '');
+        type = (t === '建议' || t === '需求' || t === '文档编写') ? t : 'BUG';
+      }
       return {
         attrs,
         description: descEl ? descEl.innerText : '',
@@ -1295,7 +1389,7 @@ async function validateBugs(onLogCallback, options = {}) {
         type,
         longYanChanges
       };
-    });
+    }, listTypeHint);
   }
 
   async function waitForPageReady(tab, timeoutMs) {
@@ -1340,6 +1434,7 @@ async function validateBugs(onLogCallback, options = {}) {
   }
 
   async function fetchBugDetail(id) {
+    const listTypeHint = typeHintById.get(id) || '';
     const tab = await context.newPage();
     try {
       const url = opOrigin + '/work_packages/' + id + '/activity';
@@ -1353,18 +1448,26 @@ async function validateBugs(onLogCallback, options = {}) {
         });
       }
 
-      let data = await scrapeOnce(tab);
+      let data = await scrapeOnce(tab, listTypeHint);
       if (!data.subject || !hasRealAttrValue(data.attrs)) {
         await tab.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
         await waitForPageReady(tab, 6000);
-        data = await scrapeOnce(tab);
+        data = await scrapeOnce(tab, listTypeHint);
+      }
+      // 列表类型提示可纠正详情页误判（详情角标缺失时）
+      if (listTypeHint) {
+        const hintType = classifyWpType(listTypeHint);
+        // 仅当详情仍是默认 BUG、且列表明确是其它类型时才覆盖，避免标题误判
+        if (hintType && data.type === 'BUG' && hintType !== 'BUG') data.type = hintType;
       }
 
-      log('✓ 已获取 BUG #' + id + ' 详情');
+      log('✓ 已获取 #' + id + ' 详情（' + (data.type || 'BUG') + '）');
       return buildBugFromParts(id, data);
     } catch (err) {
-      console.error('  ⚠️ BUG #' + id + ' 获取失败:', err.message.substring(0, 60));
-      return { id, subject: '', type: '需求', hasLongYan: false, longYanChanges: [], raw: '', description: '',
+      console.error('  ⚠️ #' + id + ' 获取失败:', err.message.substring(0, 60));
+      // 不要用「需求」当失败占位，否则会被整行隐藏
+      const failType = classifyWpType(listTypeHint) || 'BUG';
+      return { id, subject: '', type: failType, fetchFailed: true, hasLongYan: false, longYanChanges: [], raw: '', description: '',
                phenomenon: '', reproduceCondition: '', reproduceProb: '', reproduceSteps: '',
                expectedResult: '', actualResult: '', reproduceLatest: '', reproduceLatestShort: '',
                ctrlVersion: '', softwareVersions: '', assignee: '', responsible: '', dev: '',
@@ -1402,6 +1505,16 @@ async function validateBugs(onLogCallback, options = {}) {
     const checks = [];
     
     // === 规则0: 类型分支 ===
+    if (bug.fetchFailed) {
+      checks.push({ name: '必填项', pass: false, details: ['❌ 详情获取失败，无法校验（请重试或打开单号确认）'] });
+      checks.push({ name: '人员', pass: true, details: ['⏭️ 详情获取失败，跳过'] });
+      checks.push({ name: '版本', pass: true, details: ['⏭️ 详情获取失败，跳过'] });
+      checks.push({ name: '模块', pass: true, details: ['⏭️ 详情获取失败，跳过'] });
+      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ 详情获取失败，跳过'] });
+      results.push({ id: bug.id, subject: bug.subject, type: bug.type, checks, fetchFailed: true });
+      continue;
+    }
+
     if (bug.type === '需求') {
       // 需求直接跳过所有校验
       checks.push({ name: '必填项', pass: true, details: ['⏭️ 需求类型，跳过校验'] });
@@ -1412,52 +1525,65 @@ async function validateBugs(onLogCallback, options = {}) {
       results.push({ id: bug.id, subject: bug.subject, type: bug.type, checks });
       continue;
     }
-    
+
+    if (bug.type === '文档编写') {
+      // 文档编写：非缺陷单，跳过 BUG 规则
+      checks.push({ name: '必填项', pass: true, details: ['⏭️ 文档编写类型，跳过 BUG 校验'] });
+      checks.push({ name: '人员', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
+      checks.push({ name: '版本', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
+      checks.push({ name: '模块', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
+      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
+      results.push({ id: bug.id, subject: bug.subject, type: bug.type, checks });
+      continue;
+    }
+
     if (bug.type === '建议') {
-      // 建议：仅校验受理人、关联产品、负责人、发现BUG版本、模块、Release Phase、版本
-      const sugDetails = [];
-      if (!bug.assignee || bug.assignee === '-') sugDetails.push('❌ 受理人未填写');
-      else sugDetails.push('✓ 受理人已填写(' + bug.assignee.substring(0, 10) + ')');
-      
-      if (!bug.product || bug.product === '-') sugDetails.push('❌ 关联产品未填写');
-      else sugDetails.push('✓ 关联产品已填写');
-      
-      if (bug.responsible && bug.responsible.includes(expectedResponsible)) {
-        sugDetails.push('✓ 负责人正确(' + expectedResponsible + ')');
-      } else {
-        sugDetails.push('❌ 负责人应为"' + expectedResponsible + '"，当前: ' + (bug.responsible || '空'));
-      }
-      
+      // 建议：受理人、关联产品、负责人、发现BUG版本、模块、Release Phase、版本
+      const sugRequired = [];
+      const sugPerson = [];
+      const sugVersion = [];
+      const sugModule = [];
+
+      if (!bug.assignee || bug.assignee === '-') sugRequired.push('❌ 受理人未填写');
+      else sugRequired.push('✓ 受理人已填写(' + bug.assignee.substring(0, 10) + ')');
+
+      if (!bug.product || bug.product === '-') sugRequired.push('❌ 关联产品未填写');
+      else sugRequired.push('✓ 关联产品已填写');
+
       if (bug.foundVersions && bug.foundVersions !== '-') {
-        sugDetails.push('✓ 发现BUG版本已填写: ' + bug.foundVersions);
+        sugRequired.push('✓ 发现BUG版本已填写: ' + bug.foundVersions);
       } else {
-        sugDetails.push('❌ 发现BUG版本未填写');
+        sugRequired.push('❌ 发现BUG版本未填写');
       }
-      
-      // 模块（同BUG一样校验）
+
+      if (bug.responsible && bug.responsible.includes(expectedResponsible)) {
+        sugPerson.push('✓ 负责人正确(' + expectedResponsible + ')');
+      } else {
+        sugPerson.push('❌ 负责人应为"' + expectedResponsible + '"，当前: ' + (bug.responsible || '空'));
+      }
+
       const modResult = checkModule(bug.module);
-      sugDetails.push(modResult.pass ? '✓ 模块' + modResult.detail : '❌ 模块' + modResult.detail);
-      
-      // Release Phase: 发现BUG版本多选→Product Release，单选→DEV
+      sugModule.push(modResult.pass ? '✓ 模块' + modResult.detail : '❌ 模块' + modResult.detail);
+
       const foundIsMulti = bug.foundVersions && /[\n,，、]/.test(bug.foundVersions);
       const expectedReleasePhase = foundIsMulti ? 'Product Release' : 'DEV';
-      if (bug.releasePhase.toLowerCase() !== expectedReleasePhase.toLowerCase()) {
-        sugDetails.push('❌ 发现BUG版本' + (foundIsMulti ? '多选' : '单选') + '，Release Phase应为"' + expectedReleasePhase + '"，当前: ' + (bug.releasePhase || '空'));
+      if ((bug.releasePhase || '').toLowerCase() !== expectedReleasePhase.toLowerCase()) {
+        sugVersion.push('❌ 发现BUG版本' + (foundIsMulti ? '多选' : '单选') + '，Release Phase应为"' + expectedReleasePhase + '"，当前: ' + (bug.releasePhase || '空'));
       } else {
-        sugDetails.push('✓ Release Phase = ' + expectedReleasePhase + ' ✓' + (foundIsMulti ? '(多选)' : '(单选)'));
+        sugVersion.push('✓ Release Phase = ' + expectedReleasePhase + (foundIsMulti ? '(多选)' : '(单选)'));
       }
-      
-      if (bug.version.toLowerCase() !== 'product backlog') {
-        sugDetails.push('❌ 版本应为"Product backlog"，当前: ' + (bug.version || '空'));
+      if ((bug.version || '').toLowerCase() !== 'product backlog') {
+        sugVersion.push('❌ 版本应为"Product backlog"，当前: ' + (bug.version || '空'));
       } else {
-        sugDetails.push('✓ 版本 = Product backlog ✓');
+        sugVersion.push('✓ 版本 = Product backlog');
       }
-      
-      checks.push({ name: '必填项', pass: sugDetails.every(d => d.includes('✓')), details: sugDetails });
-      checks.push({ name: '人员', pass: true, details: ['⏭️ 建议类型精简校验'] });
-      checks.push({ name: '版本', pass: true, details: ['⏭️ 建议类型精简校验'] });
-      checks.push({ name: '模块', pass: true, details: ['⏭️ 建议类型精简校验'] });
-      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ 建议类型精简校验'] });
+
+      const passOf = (arr) => arr.every(d => d.includes('✓'));
+      checks.push({ name: '必填项', pass: passOf(sugRequired), details: sugRequired });
+      checks.push({ name: '人员', pass: passOf(sugPerson), details: sugPerson });
+      checks.push({ name: '版本', pass: passOf(sugVersion), details: sugVersion });
+      checks.push({ name: '模块', pass: passOf(sugModule), details: sugModule });
+      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ 建议类型不校验关联工艺'] });
       results.push({ id: bug.id, subject: bug.subject, type: bug.type, checks });
       continue;
     }
@@ -1729,7 +1855,7 @@ const LAST_REPORT_FILE = path.join(DATA_DIR, 'last_report.html');
 const SUMMARY_FILE = path.join(DATA_DIR, 'result_summary.json');
 
 function countSummary(bugs) {
-  const list = (bugs || []).filter(b => b.type !== '需求');
+  const list = (bugs || []).filter(b => b.type === 'BUG' || b.type === '建议');
   return {
     total: list.length,
     pass: list.filter(b => b.checks && b.checks.every(c => c.pass)).length,
@@ -1739,7 +1865,7 @@ function countSummary(bugs) {
 }
 
 async function saveValidationArtifacts(result) {
-  const bugs = (result.bugs || []).filter(b => b.type !== '需求');
+  const bugs = (result.bugs || []).filter(b => b.type === 'BUG' || b.type === '建议');
   const summary = countSummary(bugs);
   try { require('fs').writeFileSync(SUMMARY_FILE, JSON.stringify(summary), 'utf-8'); } catch {}
   try {
@@ -2155,7 +2281,7 @@ const server = http.createServer(async (req, res) => {
       const summary = await saveValidationArtifacts(result);
 
       if (!clientDisconnected) {
-        res.write(JSON.stringify({ type: 'result', bugs: result.bugs.filter(b => b.type !== '需求'), logs: result.logs, opOrigin: result.opOrigin }) + '\n');
+        res.write(JSON.stringify({ type: 'result', bugs: result.bugs, logs: result.logs, opOrigin: result.opOrigin }) + '\n');
         res.end();
       }
     } catch (err) {
