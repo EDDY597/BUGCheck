@@ -2,8 +2,12 @@
 node_modules/
 
 # Runtime data & secrets (credentials, cookies, logs, reports)
-data/
+# 注意：git 无法把文件从「被排除的目录」里重新包含回来，
+# 所以这里排除 data/ 下的内容，但保留目录本身与规格表（规格表是配置，需纳入版本管理）。
+data/*
 !data/.gitkeep
+!data/规格.json
+!data/spec-tree.json
 
 # Distribution packages (build artifacts)
 分发包/

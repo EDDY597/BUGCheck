@@ -10,11 +10,12 @@ if out_parent.exists():
     shutil.rmtree(out_parent)
 
 # 保持与源码相同的目录结构
-# 注意：只「复制」根目录的使用方法.md/.docx 到分发包，不改写源文件；
+# 注意：只「复制」根目录的使用方法.docx 到分发包，不改写源文件；
 # docs\ 为维护者文档，不进分发包。
 pairs = [
     ("src/validate-server.js", "src/validate-server.js"),
     ("src/module-data.js", "src/module-data.js"),
+    ("src/spec-tree.default.json", "src/spec-tree.default.json"),
     ("package.json", "package.json"),
     ("package-lock.json", "package-lock.json"),
     ("scripts/notify.ps1", "scripts/notify.ps1"),
@@ -26,7 +27,6 @@ pairs = [
     ("stop.bat", "stop.bat"),
     ("install.bat", "install.bat"),
     ("run-once.vbs", "run-once.vbs"),
-    ("使用方法.md", "使用方法.md"),
     ("使用方法.docx", "使用方法.docx"),
 ]
 missing = []
@@ -47,10 +47,18 @@ cfg = {
     "versionOrder": "1.16.0、1.15.0、1.14.11、1.12.10",
     "responsible": "黄贵良", "tester": "",
     "dingtalkEnabled": False, "dingtalkWebhook": "", "dingtalkSecret": "",
+    "craftRuleEnabled": True,
 }
 (out_dir / "data" / "login_config.json").write_text(
     json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
 )
+
+# 规格表：随包发一份当前权威内容，用户可直接改 data/规格.json
+spec_src = root / "data" / "规格.json"
+if spec_src.exists():
+    (out_dir / "data" / "规格.json").write_bytes(spec_src.read_bytes())
+else:
+    missing.append("data/规格.json")
 
 np = out_dir / "scripts" / "notify.ps1"
 if np.exists():

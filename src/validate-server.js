@@ -59,7 +59,8 @@ function loadServerConfig() {
   const data = {
     username: '', password: '', listUrl: DEFAULT_LIST_QUERY,
     versionOrder: '', responsible: '', tester: '',
-    dingtalkEnabled: false, dingtalkWebhook: '', dingtalkSecret: ''
+    dingtalkEnabled: false, dingtalkWebhook: '', dingtalkSecret: '',
+    craftRuleEnabled: true
   };
   try {
     if (require('fs').existsSync(CONFIG_FILE)) {
@@ -73,6 +74,8 @@ function loadServerConfig() {
       data.dingtalkEnabled = !!raw.dingtalkEnabled;
       data.dingtalkWebhook = raw.dingtalkWebhook || '';
       data.dingtalkSecret = raw.dingtalkSecret || '';
+      // 未写过的老配置按「开启」处理，避免升级后行为静默变化
+      data.craftRuleEnabled = raw.craftRuleEnabled !== false;
     }
   } catch {}
   return data;
@@ -105,15 +108,28 @@ function saveServerConfig(cfg) {
         : prev.dingtalkWebhook,
       dingtalkSecret: (cfg.dingtalkSecret != null && String(cfg.dingtalkSecret).trim() !== '')
         ? String(cfg.dingtalkSecret).trim()
-        : prev.dingtalkSecret
+        : prev.dingtalkSecret,
+      // 布尔开关必须用 != null 判断，否则「关闭」会被当成「未提供」而回退成开启
+      craftRuleEnabled: cfg.craftRuleEnabled != null
+        ? !!cfg.craftRuleEnabled
+        : prev.craftRuleEnabled
     };
     require('fs').writeFileSync(CONFIG_FILE, JSON.stringify(payload, null, 2), 'utf-8');
   } catch {}
 }
 
-// 列表 URL 原样使用（以用户/查询保存的过滤条件为准）。
-// 仅去掉 query_props 里的 type 过滤，避免旧配置只拉 7/37 而漏掉「建议」。
-function removeTypeFiltersFromUrl(urlString) {
+// 列表 URL 处理：
+// 1) 尊重 URL 里的 query_props（用户在页面上调的筛选条件直接生效）
+// 2) 把 type 过滤条件改写成「需要校验的类型白名单」，而**不是删掉**
+//    —— 删掉会把「测试」「文档编写」等无关类型也拉进来；
+//       只留查询原本的 Bug+建议 又会漏掉配置不全的查询。白名单两头都兼顾。
+//    OpenProject 类型 ID：1=Task 2=Feature 3=Support 4=Epic 5=User story
+//                        6=Phase 7=Bug 8=Milestone 9=Summary 37=建议(自定义)
+const OP_TYPE_IDS_ALL = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '37'];
+// 只关心「会进结果表的类型 + 会被跳过的已知类型」，用不到的类型直接不拉
+const OP_TYPE_IDS_KEEP = ['7', '37', '10', '11'];
+
+function rewriteUrlTypeFilter(urlString) {
   try {
     const u = new URL(urlString, OP_DEFAULT_BASE + '/');
     const raw = u.searchParams.get('query_props');
@@ -121,10 +137,20 @@ function removeTypeFiltersFromUrl(urlString) {
     let props = JSON.parse(raw);
     if (typeof props === 'string') props = JSON.parse(props);
     if (!props || typeof props !== 'object') return urlString;
-    if (Array.isArray(props.f)) {
-      const next = props.f.filter(f => !f || f.n !== 'type');
-      if (next.length === props.f.length) return urlString;
-      props.f = next;
+    if (!Array.isArray(props.f)) return urlString;
+
+    // 找出 type 条件；没有则补一个，保证白名单生效
+    const typeFilters = props.f.filter(f => f && f.n === 'type');
+    if (typeFilters.length === 1) {
+      // 保留用户/查询选定的类型，不做增删 —— 这是「不偏多」的关键
+      const keep = typeFilters[0];
+      const vals = Array.isArray(keep.v) ? keep.v.map(String) : [];
+      if (!vals.length) keep.v = OP_TYPE_IDS_KEEP.slice();
+      props.f = props.f.filter(f => f !== keep);
+      props.f.push(keep);   // 归一：不改变语义
+    } else if (typeFilters.length === 0) {
+      // 查询本身没限定类型 → 用白名单兜住，避免把测试/文档编写也拉进来
+      props.f.push({ n: 'type', o: '=', v: OP_TYPE_IDS_KEEP.slice() });
     }
     u.searchParams.set('query_props', JSON.stringify(props));
     return u.toString();
@@ -140,39 +166,132 @@ function normalizeListUrl(input) {
     if (u.startsWith('/')) u = u.slice(1);
     u = OP_DEFAULT_BASE + '/' + u;
   }
-  return removeTypeFiltersFromUrl(u);
+  return rewriteUrlTypeFilter(u);
+}
+
+// 解析 URL 里的 query_props（页面筛选状态的序列化形式）
+function parseQueryProps(urlString) {
+  try {
+    const u = new URL(String(urlString), OP_DEFAULT_BASE + '/');
+    const raw = u.searchParams.get('query_props');
+    if (!raw) return null;
+    let props = JSON.parse(raw);
+    if (typeof props === 'string') props = JSON.parse(props);
+    return (props && typeof props === 'object') ? props : null;
+  } catch {
+    return null;
+  }
+}
+
+// OP 的类型 ID → 名称（用于日志展示；未知 ID 原样显示）
+const OP_TYPE_ID_NAMES = {
+  '1': 'Task', '2': 'Feature', '3': 'Support', '4': 'Epic', '5': 'User story',
+  '6': 'Phase', '7': 'Bug', '8': 'Milestone', '9': 'Summary', '37': '建议'
+};
+
+// query_props.f → API v3 的 filters 数组
+// OP 的 HA 属性名与 API 属性名基本一致，运算符也一致（=、!、o、w、>t-、t- 等）
+function queryPropsToApiFilters(props) {
+  const out = [];
+  for (const f of (props.f || [])) {
+    if (!f || !f.n) continue;
+    let vals = Array.isArray(f.v) ? f.v.slice() : (f.v == null ? [] : [f.v]);
+    // 特殊值 'me' 在 API 里同样写作 'me'，保持原样
+    out.push({ [f.n]: { operator: String(f.o || '='), values: vals.map(String) } });
+  }
+  return out;
+}
+
+// query_props.t（如 "createdAt:desc,id:asc"）→ API sortBy [["createdAt","desc"],["id","asc"]]
+function queryPropsSortToApi(t) {
+  if (!t || typeof t !== 'string') return [];
+  return t.split(',').map(seg => {
+    const [field, dir] = seg.split(':').map(s => (s || '').trim());
+    if (!field) return null;
+    return [field, (dir || 'asc').toLowerCase() === 'desc' ? 'desc' : 'asc'];
+  }).filter(Boolean);
+}
+
+// 需要校验的类型（会进结果表并计分）
+const VALIDATED_TYPES = ['BUG', '建议'];
+// 非缺陷单：跳过全部 BUG 规则，且不进结果表
+// 「测试」= OpenProject 的测试类型单，不属于缺陷，绝不能按 BUG 校验
+const SKIP_TYPES = ['需求', '其他', '文档编写', '测试'];
+// 未识别类型：既不校验也不算 BUG，单独记录并在日志中暴露
+const UNKNOWN_TYPE = '未知类型';
+
+// 各类型的别名（字面量 + 常见拼写/写法变体）。顺序 = 判定优先级，BUG 放最后作真正兜底。
+const TYPE_ALIASES = [
+  ['建议',   ['建议', 'Suggestion', 'Improvement', '优化建议']],
+  ['需求',   ['需求', 'Requirement', 'Feature', 'Featrue', 'User Story', 'Story']],
+  ['文档编写', ['文档编写', '文档', 'Documentation', 'Docs', 'Doc']],
+  // 用例编写 / 测试用例编写 等「XX编写」同族写法一并归入测试
+  ['测试',   ['测试', '测试用例', '测试执行', '用例', '用例编写', '测试用例编写', '用例设计', 'Test', 'Testing', 'Test Case', 'Testcase']],
+  ['其他',   ['其他', 'Other', 'Task', '任务', 'Epic', '史诗', 'Milestone', '里程碑', 'Phase', '阶段', 'Support', '支持']],
+  ['BUG',    ['Bug', 'BUG', '缺陷', 'Defect', 'Issue', 'Fault']]
+];
+
+// 常见英文拼写容错：把相邻字符对按字典序折叠，使 featrue/fetaure 与 feature 归一到同一 key
+// （只对纯 ASCII 词生效；中文走精确匹配，避免误伤）
+function _foldAscii(s) {
+  const t = String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+  let out = '';
+  for (let i = 0; i < t.length; i += 2) {
+    const a = t[i];
+    const b = t[i + 1];
+    if (b === undefined) { out += a; break; }
+    out += a <= b ? a + b : b + a;
+  }
+  return out;
+}
+function _isAscii(s) {
+  return /^[A-Za-z][A-Za-z ]*$/.test(String(s || '').trim());
+}
+function _aliasHit(alias, s) {
+  const a = String(alias || '').trim();
+  if (!a) return false;
+  if (s === a) return true;
+  // 纯英文：折叠后比较，容忍相邻字母转置（featrue → feature）
+  if (_isAscii(a) && _isAscii(s)) return _foldAscii(s) === _foldAscii(a);
+  // 中文：忽略空白后精确比较
+  return s.replace(/\s+/g, '') === a.replace(/\s+/g, '');
 }
 
 // 类型识别：显式类型名 / 中英文前缀 / 尾缀括号；避免关联单标题里的「建议」抢判
 function classifyWpType(raw) {
-  const s = String(raw || '').trim();
-  if (!s) return '';
-  // 整串就是类型名
-  if (/^(建议|Suggestion|Improvement)$/i.test(s)) return '建议';
-  if (/^(需求|Requirement|Feature|User Story|Story)$/i.test(s)) return '需求';
-  if (/^(文档编写|文档|Documentation|Docs?)$/i.test(s)) return '文档编写';
-  if (/^(Bug|BUG|缺陷|Defect|Issue|Fault)$/i.test(s)) return 'BUG';
-  if (/^(其他|Other|Task|任务|Epic|史诗|Milestone|里程碑|Phase|阶段|Support|支持)$/i.test(s)) return '其他';
+  return classifyWpTypeInner(String(raw || '').trim(), 0);
+}
+function classifyWpTypeInner(s, depth) {
+  if (!s || depth > 3) return '';
+  // 整串就是类型名（含拼写变体）
+  for (const [type, aliases] of TYPE_ALIASES) {
+    if (aliases.some(a => _aliasHit(a, s))) return type;
+  }
+  // 递归摘取子串时必须确保「真的变短了」，否则会自我递归爆栈
+  const dig = (sub) => {
+    const t = String(sub || '').trim();
+    if (!t || t === s) return '';
+    return classifyWpTypeInner(t, depth + 1);
+  };
   // 尾缀：xxx (需求) / xxx（建议）
-  const trail = s.match(/[（(]\s*(建议|需求|文档编写|文档|Bug|BUG|缺陷|Suggestion|Improvement|Feature|Requirement|Story|User Story|Documentation|Docs?|Defect|Issue|Fault|Task|任务|Epic)\s*[)）]\s*$/i);
-  if (trail) return classifyWpType(trail[1]);
-  // 括号前缀：【需求】xxx / [建议] xxx
-  if (/^[【\[]\s*(建议|Suggestion|Improvement)\s*[】\]]/i.test(s)) return '建议';
-  if (/^[【\[]\s*(需求|Requirement|Feature|User Story|Story)\s*[】\]]/i.test(s)) return '需求';
-  if (/^[【\[]\s*(文档编写|文档|Documentation|Docs?)\s*[】\]]/i.test(s)) return '文档编写';
-  if (/^[【\[]\s*(Bug|BUG|缺陷|Defect|Issue|Fault)\s*[】\]]/i.test(s)) return 'BUG';
-  // 中文冒号前缀：需求：xxx / 建议：xxx
-  if (/^(建议|Suggestion|Improvement)\s*[:：]/i.test(s)) return '建议';
-  if (/^(需求|Requirement|Feature|User Story|Story)\s*[:：]/i.test(s)) return '需求';
-  if (/^(文档编写|文档|Documentation|Docs?)\s*[:：]/i.test(s)) return '文档编写';
-  if (/^(缺陷|Bug|BUG|Defect|Issue|Fault)\s*[:：]/i.test(s)) return 'BUG';
-  if (/^(任务|Task|Epic|史诗|其他|Other)\s*[:：]/i.test(s)) return '其他';
-  // 英文前缀：Feature: xxx（\b 防止 Bugfix / Bugs 误命中）
-  if (/^(Suggestion|Improvement)\b/i.test(s)) return '建议';
-  if (/^(Feature|Requirement|User Story|Story)\b/i.test(s)) return '需求';
-  if (/^(Documentation|Docs?)\b/i.test(s)) return '文档编写';
-  if (/^(Bug|Defect|Issue|Fault)\b/i.test(s)) return 'BUG';
-  if (/^(Task|Epic|Milestone|Phase|Support)\b/i.test(s)) return '其他';
+  const trail = s.match(/[（(]\s*([^（()）]{1,24})\s*[)）]\s*$/);
+  if (trail) {
+    const inner = dig(trail[1]);
+    if (inner) return inner;
+  }
+  // 前缀（括号 / 中文冒号 / 英文冒号）：【需求】xxx、【测试】xxx、需求：xxx、Feature: xxx
+  const prefix = s.match(/^[【\[]\s*([^】\]]{1,24})\s*[】\]]/) || s.match(/^([^:：]{1,24})\s*[:：]/);
+  if (prefix) {
+    const inner = dig(prefix[1]);
+    if (inner) return inner;
+  }
+  // 英文前缀兜底：Feature xxx / Bug xxx（\b 防止 Bugfix / Bugs 误命中）
+  // 末尾必须还有内容，避免整串被当作前缀再次递归
+  const word = s.match(/^([A-Za-z][A-Za-z ]{0,20}?)\b[\s:：-]+(.+)$/);
+  if (word) {
+    const inner = dig(word[1]);
+    if (inner) return inner;
+  }
   return '';
 }
 
@@ -180,16 +299,18 @@ function extractOrigin(url) {
   try { return new URL(url).origin; } catch { return OP_DEFAULT_BASE; }
 }
 
-// 模块层级数据
-let checkModule, getLastSegment;
-try {
-  const mod = require('./module-data');
-  checkModule = mod.checkModule;
-  getLastSegment = mod.getLastSegment;
-} catch (e) {
-  console.error('❌ 模块数据文件(module-data.js)加载失败:', e.message);
-  console.error('   请确认 module-data.js 存在于工具目录中');
-  process.exit(1);
+// 模块层级数据（用户可编辑 data/规格.json；加载器自带校验与内置兜底，不抛异常）
+const moduleData = require('./module-data');
+const checkModule = moduleData.checkModule;
+const getLastSegment = moduleData.getLastSegment;
+{
+  const st = moduleData.getLoadState();
+  if (st.error) {
+    console.error('⚠️  规格表: ' + st.error);
+    console.error('    当前使用: ' + (st.source === 'user' ? '用户文件' : st.source === 'default' ? '内置默认表' : '最小内置表'));
+  } else {
+    console.log('✓ 规格表已加载: ' + st.file + `（${st.specCount} 个一级规格 / ${st.leafCount} 个最末级）`);
+  }
 }
 
 // 默认版本链路（从新到旧），可在 UI 设置中覆盖
@@ -200,7 +321,8 @@ const DEFAULT_SETTINGS = {
   listUrl: DEFAULT_LIST_QUERY,
   versionOrder: DEFAULT_VERSION_ORDER.slice(),
   responsible: '黄贵良',
-  tester: ''
+  tester: '',
+  craftRuleEnabled: true   // 关联工艺校验开关（默认开启，保持原有行为）
 };
 
 function parseVersionOrder(str) {
@@ -298,6 +420,43 @@ function getHTML() {
   .btn-secondary:hover{background:#eef2ff;border-color:#6366f1;box-shadow:0 2px 10px rgba(99,102,241,.15)}
   .btn-secondary:active{transform:scale(.98)}
   .toolbar-left{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+
+  /* ── 设置弹窗：分组标题 + 开关行 ── */
+  .form-divider{
+    font-size:12px;font-weight:700;color:#94a3b8;letter-spacing:.06em;
+    margin:22px 0 12px;padding-top:16px;border-top:1px solid #eef2f7;
+    text-transform:uppercase
+  }
+  .form-divider:first-child{margin-top:0;padding-top:0;border-top:none}
+  .switch-row{
+    display:flex;align-items:flex-start;justify-content:space-between;gap:16px;
+    padding:12px 14px;border:1.5px solid #e8edf5;border-radius:12px;
+    background:#fbfcfe;transition:border-color .15s,background .15s
+  }
+  .switch-row:hover{border-color:#dbe3f0;background:#f8faff}
+  .switch-row .switch-text{min-width:0;flex:1}
+  /* 字号对齐弹窗内其它表单项：标题 13px / 说明 12px */
+  .switch-row .switch-title{font-size:13px;font-weight:600;color:#334155;margin-bottom:6px;line-height:1.4}
+  .switch-row .hint{font-size:12px;color:#94a3b8;margin-top:0;line-height:1.4}
+  /* 开关本体：靠 input:checked 驱动，无文字标签 */
+  .switch{position:relative;display:inline-flex;flex-shrink:0;cursor:pointer;margin-top:2px}
+  .switch input{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
+  .switch .track{
+    position:relative;width:42px;height:24px;border-radius:999px;
+    background:#cbd5e1;transition:background .18s ease;
+    box-shadow:inset 0 1px 2px rgba(15,23,42,.08)
+  }
+  .switch .track::after{
+    content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;
+    background:#fff;border-radius:50%;
+    box-shadow:0 1px 3px rgba(15,23,42,.3);
+    transition:transform .18s cubic-bezier(.4,0,.2,1)
+  }
+  .switch input:checked + .track{background:#6366f1}
+  .switch input:checked + .track::after{transform:translateX(18px)}
+  .switch input:focus-visible + .track{box-shadow:0 0 0 3px rgba(99,102,241,.28)}
+  .switch:hover .track{background:#b6c2d3}
+  .switch input:checked:hover + .track{background:#4f46e5}
   /* ── settings modal ── */
   .modal-overlay{
     position:fixed;inset:0;background:rgba(15,23,42,.45);
@@ -446,6 +605,7 @@ function getHTML() {
       <span class="loading-text" id="progressPct" style="font-size:18px;font-weight:700;color:#6366f1;min-width:52px">0%</span>
     </div>
   </div>
+  <div id="specBanner" style="display:none;margin:0 0 14px;padding:12px 14px;border-radius:10px;font-size:14px;line-height:1.6"></div>
   <div class="toolbar">
     <div class="toolbar-left">
       <button class="btn" id="runBtn" onclick="runValidation()">▶ 运行校验</button>
@@ -502,6 +662,20 @@ function getHTML() {
           <input type="text" id="setTester" placeholder="选填，不填则跳过 Tester 校验" autocomplete="off">
           <div class="hint">BUG 的「Tester」字段必须是此人</div>
         </div>
+
+        <div class="form-divider">校验规则</div>
+        <div class="switch-row">
+          <div class="switch-text">
+            <div class="switch-title">关联工艺校验</div>
+            <div class="hint">BUG 含工艺关键词时，检查「关联工艺」是否已填写；关闭后该项显示为已跳过</div>
+          </div>
+          <label class="switch" title="切换关联工艺校验">
+            <input type="checkbox" id="craftRuleToggle">
+            <span class="track"></span>
+          </label>
+        </div>
+
+        <div class="form-divider">钉钉推送</div>
         <div class="form-group">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
             <input type="checkbox" id="setDingtalkEnabled" style="width:auto">
@@ -559,7 +733,8 @@ const DEFAULT_UI_SETTINGS = {
   tester: '',
   dingtalkEnabled: false,
   dingtalkWebhook: '',
-  dingtalkSecret: ''
+  dingtalkSecret: '',
+  craftRuleEnabled: true
 };
 const SETTING_FIELD_IDS = [
   'setUsername', 'setPassword', 'setListUrl',
@@ -568,6 +743,8 @@ const SETTING_FIELD_IDS = [
 ];
 
 let serverSettingsCache = null;
+// 页面加载即开始预取设置，runValidation 会 await 它，避免点太快时用到硬编码默认值
+let settingsReady = null;
 let autosaveTimer = null;
 let settingsDirty = false;
 let applyingSettings = false; // 回填时不触发自动保存
@@ -590,6 +767,14 @@ function loadUISettings() {
   return { ...DEFAULT_UI_SETTINGS, ...base };
 }
 
+// 确保设置已从服务端加载（未加载则等待），避免竞态导致用默认值校验
+async function ensureSettingsLoaded() {
+  if (serverSettingsCache) return serverSettingsCache;
+  if (!settingsReady) settingsReady = fetchServerSettings();
+  await settingsReady;
+  return loadUISettings();
+}
+
 function readSettingsForm() {
   return {
     username: document.getElementById('setUsername').value.trim(),
@@ -600,8 +785,22 @@ function readSettingsForm() {
     tester: document.getElementById('setTester').value.trim() || DEFAULT_UI_SETTINGS.tester,
     dingtalkEnabled: document.getElementById('setDingtalkEnabled').checked,
     dingtalkWebhook: document.getElementById('setDingtalkWebhook').value.trim(),
-    dingtalkSecret: document.getElementById('setDingtalkSecret').value.trim()
+    dingtalkSecret: document.getElementById('setDingtalkSecret').value.trim(),
+    craftRuleEnabled: readCraftToggle()
   };
+}
+
+// ── 关联工艺校验开关（设置弹窗内）──
+function readCraftToggle() {
+  const el = document.getElementById('craftRuleToggle');
+  return el ? !!el.checked : true;
+}
+
+function initCraftToggle() {
+  const el = document.getElementById('craftRuleToggle');
+  if (!el) return;
+  // 外观完全由 input:checked 的 CSS 驱动，这里只负责持久化
+  el.addEventListener('change', scheduleAutosave);
 }
 
 function fillSettingsForm(s) {
@@ -615,6 +814,9 @@ function fillSettingsForm(s) {
   document.getElementById('setDingtalkEnabled').checked = !!s.dingtalkEnabled;
   document.getElementById('setDingtalkWebhook').value = s.dingtalkWebhook || '';
   document.getElementById('setDingtalkSecret').value = s.dingtalkSecret || '';
+  // 关联工艺开关（与其它设置共用同一份配置）
+  const ct = document.getElementById('craftRuleToggle');
+  if (ct) ct.checked = s.craftRuleEnabled !== false;
   applyingSettings = false;
   settingsDirty = false;
 }
@@ -636,7 +838,8 @@ async function persistSettings(s, silent) {
     tester: s.tester,
     dingtalkEnabled: s.dingtalkEnabled,
     dingtalkWebhook: s.dingtalkWebhook,
-    dingtalkSecret: s.dingtalkSecret
+    dingtalkSecret: s.dingtalkSecret,
+    craftRuleEnabled: s.craftRuleEnabled !== false
   };
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(localSave));
   try {
@@ -663,7 +866,7 @@ function scheduleAutosave() {
 }
 
 async function openSettings() {
-  const s = await fetchServerSettings();
+  const s = await ensureSettingsLoaded();
   fillSettingsForm(s);
   document.getElementById('settingsModal').classList.add('show');
 }
@@ -684,7 +887,9 @@ function resetSettings() {
     listUrl: DEFAULT_UI_SETTINGS.listUrl,
     versionOrder: DEFAULT_UI_SETTINGS.versionOrder,
     responsible: DEFAULT_UI_SETTINGS.responsible,
-    tester: DEFAULT_UI_SETTINGS.tester
+    tester: DEFAULT_UI_SETTINGS.tester,
+    // 开关不参与「恢复默认」，避免误点后静默改掉校验范围
+    craftRuleEnabled: cur.craftRuleEnabled
   });
   scheduleAutosave();
 }
@@ -701,9 +906,61 @@ function bindSettingsAutosave() {
 }
 
 // 页面加载时预取服务端设置并绑定自动保存
-fetchServerSettings();
+settingsReady = fetchServerSettings();
 bindSettingsAutosave();
+initCraftToggle();
+// 设置到位后把开关刷成服务端的真实状态（HTML 默认勾选，此处纠正）
+settingsReady.then(s => {
+  const el = document.getElementById('craftRuleToggle');
+  if (el) el.checked = s.craftRuleEnabled !== false;
+});
 loadLastResults();
+loadSpecStatus();
+
+// 规格表（data/规格.json）加载状态
+// 正常情况只往日志框打一行；只有出问题（回退/解析失败）才在页面顶部显示横幅
+// 注意：日志框在「运行校验」时会被清空，所以这里把文案缓存下来，
+//      由 logSpecSummary() 在校验开始后重新打印，保证全程可见。
+let specSummaryLine = '';
+
+function logSpecSummary() {
+  if (specSummaryLine) log(specSummaryLine);
+}
+
+async function loadSpecStatus() {
+  const el = document.getElementById('specBanner');
+  let st;
+  try {
+    st = await (await fetch('/spec-status')).json();
+  } catch { return; }
+  if (!st || st.error === undefined) return;
+
+  if (st.error) {
+    // 用户文件有问题，已回退 —— 需要显眼，保留横幅
+    if (!el) return;
+    const isFallback = st.source !== 'user';
+    el.style.display = 'block';
+    el.style.background = isFallback ? '#fef2f2' : '#fffbeb';
+    el.style.border = '1px solid ' + (isFallback ? '#fecaca' : '#fde68a');
+    el.style.color = isFallback ? '#991b1b' : '#92400e';
+    el.innerHTML = '<b>' + (isFallback ? '⚠️ 规格表未能加载，正在使用' + (st.source === 'default' ? '内置默认表' : '最小内置表') : '⚠️ 规格表存在问题') + '</b><br>' +
+      escapeHtml(st.error) +
+      (isFallback ? '<br><span style="opacity:.85">请检查 <code>data/规格.json</code> 的 JSON 格式（常见原因：多余逗号、中文引号、括号不配对）。修好后<b>重启工具</b>生效。</span>' : '');
+    specSummaryLine = '⚠️ ' + st.error;
+    log(specSummaryLine);
+  } else if (st.source === 'user' && st.leafCount) {
+    // 正常：只在日志里留痕，不占页面顶部
+    specSummaryLine = '✓ 规格表已加载：' + st.specCount + ' 个一级规格 / ' + st.leafCount +
+      ' 个最末级规格（data/' + (st.fileName || '规格.json') + '）';
+    log(specSummaryLine);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
 
 function log(msg) {
   const box = document.getElementById('logBox');
@@ -721,7 +978,9 @@ function renderValidationResult(result, opts) {
   let rows = '';
   let displayCount = 0;
   let rpCountAll = 0, verCountAll = 0, modCountAll = 0, reqCountAll = 0, ctrlCountAll = 0, craftCountAll = 0;
-
+  let personCountAll = 0;
+  // 兜底桶：正常情况下应恒为 0。出现非 0 说明有新增校验项未在此登记分类。
+  let otherCountAll = 0;
   (result.bugs || []).sort((a, b) => {
     // 1) 校验失败置顶  2) 被龙燕/黄贵良改过  3) 其余
     const aFail = a.checks && a.checks.every(c => c.pass) ? 0 : 1;
@@ -734,7 +993,7 @@ function renderValidationResult(result, opts) {
   });
 
   for (const bug of result.bugs || []) {
-    // 结果页只展示 BUG / 建议
+    // 结果页只展示 BUG / 建议（测试/需求/文档编写/其他 一律不展示）
     if (bug.type !== 'BUG' && bug.type !== '建议') continue;
     displayCount++;
     if (!opts.silentLogs) log('校验 BUG #' + bug.id + '...');
@@ -742,15 +1001,27 @@ function renderValidationResult(result, opts) {
     if (allPass) passCount++; else failCount++;
 
     if (!allPass) {
-      bug.checks.flatMap(c => c.details).forEach(d => {
-        if (!d.startsWith('❌')) return;
-        if (d.includes('Release Phase') || d.includes('Release')) rpCountAll++;
-        else if (d.includes('版本应为')) verCountAll++;
-        else if (d.includes('模块')) modCountAll++;
-        else if (d.includes('为空')) reqCountAll++;
-        else if (d.includes('控制器版本')) ctrlCountAll++;
-        else if (d.includes('关联工艺') || d.includes('工艺')) craftCountAll++;
-      });
+      for (const c of bug.checks) {
+        for (const d of c.details || []) {
+          if (!d.startsWith('❌')) continue;
+          // 按「校验项名」定位大类，不用消息子串猜（「为空」曾把工艺报错误判成必填项）
+          let kind = c.name;
+          // 「版本」项的明细需再细分：Release Phase / 控制器版本 / 版本号
+          if (kind === '版本') {
+            if (d.includes('Release Phase')) kind = 'Release Phase';
+            else if (d.includes('控制器版本') && d.includes('未在发现BUG版本')) kind = '控制器版本';
+            else kind = '版本号';
+          }
+          if (kind === 'Release Phase') rpCountAll++;
+          else if (kind === '版本号') verCountAll++;
+          else if (kind === '模块') modCountAll++;
+          else if (kind === '必填项') reqCountAll++;
+          else if (kind === '控制器版本') ctrlCountAll++;
+          else if (kind === '关联工艺') craftCountAll++;
+          else if (kind === '人员') personCountAll++;
+          else otherCountAll++;
+        }
+      }
     }
 
     rows += '<tr>';
@@ -781,7 +1052,7 @@ function renderValidationResult(result, opts) {
       const styledDetails = versionCheck.details.map(d => {
         const isLyEditLine = (d.startsWith('⏭️') && (d.includes('龙燕') || d.includes('黄贵良'))) ||
           ((d.includes('龙燕') || d.includes('黄贵良')) && d.includes('修改'));
-        if (isLyEditLine || d.startsWith('❌') || d.startsWith('🔄'))
+        if (isLyEditLine || d.startsWith('❌') || d.startsWith('⚠️') || d.startsWith('🔄'))
           return '<span style="color:#d00;font-weight:bold">' + d + '</span>';
         if (d.startsWith('✓') || d.startsWith('✅') || d.startsWith('📋') || d.startsWith('⏭️') || d.includes('通过'))
           return '<span style="color:#0a0">' + d + '</span>';
@@ -806,6 +1077,8 @@ function renderValidationResult(result, opts) {
   if (reqCountAll) errParts.push(reqCountAll + '个 必填项');
   if (ctrlCountAll) errParts.push(ctrlCountAll + '个 控制器版本');
   if (craftCountAll) errParts.push(craftCountAll + '个 关联工艺');
+  if (personCountAll) errParts.push(personCountAll + '个 人员');
+  if (otherCountAll) errParts.push(otherCountAll + '个 其它');
   if (errParts.length) errBreakdown = ' — <b style="color:#dc2626">不通过原因：' + errParts.join('，') + '</b>';
   const prefix = opts.fromCache ? '<strong>最近一次结果</strong>（' + new Date(result.timestamp || Date.now()).toLocaleString() + '）：' : '<strong>校验完成：</strong> ';
   summary.innerHTML = prefix + ' 共 ' + displayCount + ' 个，' +
@@ -844,10 +1117,11 @@ async function runValidation() {
   body.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:30px">正在校验...</td></tr>';
   
   log('开始获取BUG数据...(可能耗时1-2分钟)');
+  logSpecSummary();   // 日志刚被清空，补回本次校验使用的规格表信息
   const abort = new AbortController();
   const timeoutId = setTimeout(() => abort.abort(), 180000); // 3分钟超时
   try {
-    const settings = loadUISettings();
+    const settings = await ensureSettingsLoaded();
     const resp = await fetch('/validate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -857,11 +1131,13 @@ async function runValidation() {
         listUrl: settings.listUrl,
         versionOrder: settings.versionOrder,
         responsible: settings.responsible,
-        tester: settings.tester
+        tester: settings.tester,
+        craftRuleEnabled: settings.craftRuleEnabled !== false
       }),
       signal: abort.signal
     });
     clearTimeout(timeoutId);
+    if (!resp.ok) throw new Error('服务器返回 HTTP ' + resp.status + '，请查看服务端日志');
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
@@ -875,23 +1151,27 @@ async function runValidation() {
         const line = buf.substring(0, nl);
         buf = buf.substring(nl + 1);
         if (!line.trim()) continue;
+        let data;
         try {
-          const data = JSON.parse(line);
-          if (data.type === 'log') {
-            const box = document.getElementById('logBox');
-            const t = new Date().toLocaleTimeString();
-            box.textContent += '[' + t + '] ' + data.message + '\\n';
-            box.scrollTop = box.scrollHeight;
-          } else if (data.type === 'progress') {
-            const p = Math.min(100, Math.max(0, data.percent));
-            document.getElementById('progressBar').style.width = p + '%';
-            document.getElementById('progressPct').textContent = p + '%';
-          } else if (data.type === 'result') {
-            result = data;
-          } else if (data.type === 'error') {
-            throw new Error(data.message);
-          }
-        } catch (e) {}
+          data = JSON.parse(line);
+        } catch (e) {
+          continue; // 忽略非JSON行
+        }
+        if (data.type === 'log') {
+          const box = document.getElementById('logBox');
+          const t = new Date().toLocaleTimeString();
+          box.textContent += '[' + t + '] ' + data.message + '\\n';
+          box.scrollTop = box.scrollHeight;
+        } else if (data.type === 'progress') {
+          const p = Math.min(100, Math.max(0, data.percent));
+          document.getElementById('progressBar').style.width = p + '%';
+          document.getElementById('progressPct').textContent = p + '%';
+        } else if (data.type === 'result') {
+          result = data;
+        } else if (data.type === 'error') {
+          // 服务端报错：抛给外层catch，把真实原因显示出来（不能被内层catch吞掉）
+          throw new Error(data.message);
+        }
       }
       if (done) break;
     }
@@ -935,6 +1215,24 @@ function extractCtrlVersion(desc) {
   // 兼容半角/全角冒号：控制器版本: / 控制器版本：
   const m = desc && desc.match(/控制器版本[:：]\s*([^\n]+)/);
   return m ? m[1].trim() : '';
+}
+
+// 取版本号的「前两段」，如 1.15.0 → 1.15
+function majorMinor(ver) {
+  const m = String(ver || '').match(/^(\d+\.\d+)\.\d+$/);
+  return m ? m[1] : String(ver || '');
+}
+
+// Version 是否可接受：与控制器版本「前两段一致」即算匹配（第三段可不同）
+// 例：控制器 1.15.0 → Version 填 1.15.0 / 1.15.1 均通过；填 1.16.0 / 1.14.9 不通过
+function versionMatchesCtrl(version, ctrlBase) {
+  const v = String(version || '').trim();
+  const c = String(ctrlBase || '').trim();
+  if (!v || !c) return false;
+  if (v === c) return true;
+  // 必须都是 1.x.y 形式，且前两段相同
+  if (!/^\d+\.\d+\.\d+$/.test(v) || !/^\d+\.\d+\.\d+$/.test(c)) return false;
+  return majorMinor(v) === majorMinor(c);
 }
 
 // 不在结果中展示的修改字段（仍会参与跳过，只是不展示明细）
@@ -1057,6 +1355,8 @@ async function validateBugs(onLogCallback, options = {}) {
     : DEFAULT_VERSION_ORDER.slice();
   const expectedResponsible = options.responsible || DEFAULT_SETTINGS.responsible;
   const expectedTester = options.tester || DEFAULT_SETTINGS.tester;
+  // 关联工艺校验开关：只有显式传 false 才关闭
+  const craftRuleEnabled = options.craftRuleEnabled !== false;
 
   // 账号/密码/列表页：优先本次请求，其次本地配置文件
   const savedCfg = loadServerConfig();
@@ -1072,6 +1372,10 @@ async function validateBugs(onLogCallback, options = {}) {
     logs.push(m);
     console.log(m);
     if (onLogCallback) onLogCallback({ type: 'log', message: m });
+  }
+  // 只写服务端控制台，不推给前端（用于技术细节，如筛选条件原文）
+  function logServerOnly(m) {
+    console.log(m);
   }
   function sendProgress(p) {
     if (onLogCallback) onLogCallback({ type: 'progress', percent: p });
@@ -1189,67 +1493,171 @@ async function validateBugs(onLogCallback, options = {}) {
   
   const page = await context.newPage();
   timeLog('登录/认证');
-  
-  // 获取BUG列表（使用设置中的列表页 URL）
-  await page.goto(listUrl, { waitUntil: 'networkidle', timeout: 20000 });
 
-  // 提取工作项 ID + 列表类型提示（SPA异步渲染，networkidle可能过早触发 → 等待+重试）
+  // ===== 列表枚举：优先走 REST API（一次拿全，类型权威）=====
+  // DOM 方案只能读到「第一页」（分页由 query_props.pp 控制，默认 20），
+  // 且类型靠标题猜；API 方案两问题都解决，失败时再降级回 DOM。
   let bugItems = [];
-  for (let attempt = 0; attempt < 6; attempt++) {
-    try {
-      await page.waitForSelector('a[href*="/work_packages/"]', { timeout: 5000 });
-    } catch {}
-    bugItems = await page.evaluate(() => {
-      const map = new Map();
-      const rows = document.querySelectorAll('tr, .wp-table--row');
-      const add = (id, typeHint) => {
-        if (!id) return;
-        const prev = map.get(id) || { id, typeHint: '' };
-        if (!prev.typeHint && typeHint) prev.typeHint = typeHint;
-        map.set(id, prev);
-      };
-      rows.forEach(row => {
-        let id = null;
-        row.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
-          const m = a.href.match(/\/work_packages\/(\d+)/);
-          if (m) id = parseInt(m[1], 10);
-        });
-        if (!id) return;
-        // 类型列 / 图标 title
-        const hints = [];
-        row.querySelectorAll('[title]').forEach(el => {
-          const t = (el.getAttribute('title') || '').trim();
-          if (t && t.length <= 24) hints.push(t);
-        });
-        row.querySelectorAll('td, .wp-table--cell').forEach(td => {
-          const t = (td.innerText || '').trim();
-          if (t && t.length <= 24) hints.push(t);
-        });
-        let typeHint = '';
-        for (const h of hints) {
-          // 只接受整格就是类型名，避免主题/关联单里的「建议」字样误判
-          if (/^(建议|Suggestion|Improvement|需求|Requirement|Feature|User Story|Story|文档编写|文档|Documentation|Docs?|Bug|BUG|缺陷|Defect|Issue|Fault|其他|Other|Task|任务|Epic)$/i.test(h)) {
-            typeHint = h;
-            break;
-          }
-        }
-        add(id, typeHint);
-      });
-      if (!map.size) {
-        document.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
-          const m = a.href.match(/\/work_packages\/(\d+)/);
-          if (m) add(parseInt(m[1], 10), '');
-        });
-      }
-      return Array.from(map.values());
+  let listSource = '';
+
+  async function fetchListViaApi() {
+    const u = new URL(listUrl);
+    const qid = u.searchParams.get('query_id');
+    if (!qid) return null;   // 非 query 形式的列表页，走 DOM
+    // 取查询自己声明的 results 链接 → 过滤条件由 OP 生成，保证与页面语义一致
+    const qResp = await context.request.get(opOrigin + '/api/v3/queries/' + qid, {
+      headers: { 'Accept': 'application/json' }, timeout: 30000
     });
-    if (bugItems.length > 0) break;
-    await page.waitForTimeout(1500);
+    if (!qResp.ok()) return null;
+    const qJson = await qResp.json();
+    const resultsHref = qJson && qJson._links && qJson._links.results && qJson._links.results.href;
+    if (!resultsHref) return null;
+
+    const listApi = new URL(resultsHref, opOrigin);
+
+    // URL 里带了 query_props（用户在页面上调的筛选）→ 覆盖查询保存的条件，
+    // 让工具跑出来的数量和用户「页面上看到的」一致。
+    const props = parseQueryProps(listUrl);
+    let urlFilterDesc = '';
+    if (props && Array.isArray(props.f) && props.f.length) {
+      const filters = queryPropsToApiFilters(props);
+      if (filters.length) {
+        listApi.searchParams.set('filters', JSON.stringify(filters));
+        // 排序与分页也跟随页面
+        if (props.t) {
+          const sort = queryPropsSortToApi(props.t);
+          if (sort.length) listApi.searchParams.set('sortBy', JSON.stringify(sort));
+        }
+        urlFilterDesc = filters.map(f => {
+          const k = Object.keys(f)[0];
+          return k + ' ' + f[k].operator + ' [' + (f[k].values || []).join(',') + ']';
+        }).join('; ');
+      }
+    }
+    // 筛选条件原文只留给服务端日志，前端不展示
+    if (urlFilterDesc) logServerOnly('🔎 按 URL 中的筛选条件拉取：' + urlFilterDesc);
+    else logServerOnly('🔎 URL 未带筛选条件，按查询 ' + qid + ' 保存的条件拉取');
+
+    const PAGE = 500;
+    const items = [];
+    let offset = 1;
+    let total = null;
+    for (let guard = 0; guard < 40; guard++) {
+      listApi.searchParams.set('pageSize', String(PAGE));
+      listApi.searchParams.set('offset', String(offset));
+      const r = await context.request.get(listApi.toString(), {
+        headers: { 'Accept': 'application/json' }, timeout: 30000
+      });
+      if (!r.ok()) {
+        if (!items.length) return null;
+        break;
+      }
+      const j = await r.json();
+      if (total == null) total = typeof j.total === 'number' ? j.total : null;
+      const els = (j._embedded && j._embedded.elements) || [];
+      for (const e of els) {
+        const t = (e._links && e._links.type && e._links.type.title) || '';
+        items.push({ id: e.id, apiType: t, subject: e.subject || '', typeHint: t });
+      }
+      if (els.length < PAGE) break;
+      offset += PAGE;
+    }
+    if (!items.length) return null;
+    // 按 id 去重（防 offset 翻页边界重复）
+    const seen = new Set();
+    const uniq = [];
+    for (const it of items) {
+      if (seen.has(it.id)) continue;
+      seen.add(it.id);
+      uniq.push(it);
+    }
+    return { items: uniq, total };
+  }
+
+  try {
+    const api = await fetchListViaApi();
+    if (api) {
+      bugItems = api.items;
+      listSource = 'API';
+      const typeStat = {};
+      for (const it of bugItems) {
+        const k = it.apiType || '(无类型)';
+        typeStat[k] = (typeStat[k] || 0) + 1;
+      }
+      log('✅ 通过 API 获取列表：' + bugItems.length + ' 个工作项' +
+        (api.total != null ? '（查询共 ' + api.total + ' 个）' : '') +
+        '；类型分布 = ' + Object.keys(typeStat).map(k => k + ' ' + typeStat[k]).join('、'));
+    }
+  } catch (e) {
+    log('⚠️ API 获取列表失败，改用页面抓取：' + String(e.message || e).substring(0, 80));
+  }
+
+  // ===== 降级：DOM 抓取（只有第一页）=====
+  if (!bugItems.length) {
+    await page.goto(listUrl, { waitUntil: 'networkidle', timeout: 20000 });
+    // 提取工作项 ID + 列表类型提示（SPA异步渲染，networkidle可能过早触发 → 等待+重试）
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        await page.waitForSelector('a[href*="/work_packages/"]', { timeout: 5000 });
+      } catch {}
+      bugItems = await page.evaluate(() => {
+        const map = new Map();
+        const rows = document.querySelectorAll('tr, .wp-table--row');
+        const add = (id, typeHint) => {
+          if (!id) return;
+          const prev = map.get(id) || { id, typeHint: '' };
+          if (!prev.typeHint && typeHint) prev.typeHint = typeHint;
+          map.set(id, prev);
+        };
+        rows.forEach(row => {
+          let id = null;
+          row.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
+            const m = a.href.match(/\/work_packages\/(\d+)/);
+            if (m) id = parseInt(m[1], 10);
+          });
+          if (!id) return;
+          // 类型列 / 图标 title
+          const hints = [];
+          row.querySelectorAll('[title]').forEach(el => {
+            const t = (el.getAttribute('title') || '').trim();
+            if (t && t.length <= 24) hints.push(t);
+          });
+          row.querySelectorAll('td, .wp-table--cell').forEach(td => {
+            const t = (td.innerText || '').trim();
+            if (t && t.length <= 24) hints.push(t);
+          });
+          let typeHint = '';
+          for (const h of hints) {
+            // 只接受整格就是类型名，避免主题/关联单里的「建议」字样误判
+            if (/^(建议|Suggestion|Improvement|需求|Requirement|Feature|User Story|Story|文档编写|文档|Documentation|Docs?|测试|测试用例|测试执行|Test|Testing|Bug|BUG|缺陷|Defect|Issue|Fault|其他|Other|Task|任务|Epic)$/i.test(h)) {
+              typeHint = h;
+              break;
+            }
+          }
+          add(id, typeHint);
+        });
+        if (!map.size) {
+          document.querySelectorAll('a[href*="/work_packages/"]').forEach(a => {
+            const m = a.href.match(/\/work_packages\/(\d+)/);
+            if (m) add(parseInt(m[1], 10), '');
+          });
+        }
+        return Array.from(map.values());
+      });
+      if (bugItems.length > 0) break;
+      await page.waitForTimeout(1500);
+    }
+    if (bugItems.length) {
+      listSource = '页面';
+      log('⚠️ 已降级为页面抓取：仅第一页 ' + bugItems.length + ' 个工作项' +
+        '（若列表超过一页会漏，建议检查 API 可用性）');
+    }
   }
   const bugIds = bugItems.map(x => x.id);
   const typeHintById = new Map(bugItems.map(x => [x.id, x.typeHint || '']));
-  const sugPreview = bugItems.filter(x => /建议|Suggestion/i.test(x.typeHint || '')).length;
-  log('找到 ' + bugIds.length + ' 个工作项' + (sugPreview ? '（其中建议类约 ' + sugPreview + ' 个）' : ''));
+  // API 已给出权威类型的，记录下来覆盖详情页的猜测
+  const apiTypeById = new Map(bugItems.filter(x => x.apiType).map(x => [x.id, x.apiType]));
+  log('找到 ' + bugIds.length + ' 个工作项' + (listSource ? '（来源：' + listSource + '）' : ''));
 
 
   // 获取详情：只抠页面。等「标题有字」即可，空页再整页刷新重抠一次
@@ -1295,7 +1703,7 @@ async function validateBugs(onLogCallback, options = {}) {
     bug.foundVersions = parts.attrs['发现BUG版本'] || '';
     bug.releasePhase = parts.attrs['Release Phase'] || '';
     bug.version = parts.attrs['版本'] || '';
-    bug.type = parts.type || 'BUG';
+    bug.type = parts.type || UNKNOWN_TYPE;
     bug.fetchFailed = !!parts.fetchFailed;
     bug.longYanChanges = parts.longYanChanges || [];
     // 仅当 journal 里确有龙燕/黄贵良改字段时才算「被修改过」
@@ -1305,7 +1713,8 @@ async function validateBugs(onLogCallback, options = {}) {
   }
 
   async function scrapeOnce(tab, listTypeHint) {
-    return await tab.evaluate((hint) => {
+    // page.evaluate 只接受一个参数，hint 与别名表合并传入
+    return await tab.evaluate(({ hint, aliases: TYPE_ALIASES_ARG }) => {
       const attrs = {};
       document.querySelectorAll('.wp-attribute-group--attribute').forEach(el => {
         const keyEl = el.querySelector('.wp-attribute-group--attribute-key');
@@ -1355,32 +1764,49 @@ async function validateBugs(onLogCallback, options = {}) {
         if (details.length) longYanChanges.push({ time, detail: details.join('；'), user: user.trim() });
       });
       // 类型识别：类型角标/属性 → 标题前缀 → 列表提示；不要用关联单 title 抢判
-      function classify(raw) {
-        const s = String(raw || '').trim();
-        if (!s) return '';
-        if (/^(建议|Suggestion|Improvement)$/i.test(s)) return '建议';
-        if (/^(需求|Requirement|Feature|User Story|Story)$/i.test(s)) return '需求';
-        if (/^(文档编写|文档|Documentation|Docs?)$/i.test(s)) return '文档编写';
-        if (/^(Bug|BUG|缺陷|Defect|Issue|Fault)$/i.test(s)) return 'BUG';
-        if (/^(其他|Other|Task|任务|Epic|史诗|Milestone|里程碑|Phase|阶段|Support|支持)$/i.test(s)) return '其他';
-        const trail = s.match(/[（(]\s*(建议|需求|文档编写|文档|Bug|BUG|缺陷|Suggestion|Improvement|Feature|Requirement|Story|User Story|Documentation|Docs?|Defect|Issue|Fault|Task|任务|Epic)\s*[)）]\s*$/i);
-        if (trail) return classify(trail[1]);
-        if (/^[【\[]\s*(建议|Suggestion|Improvement)\s*[】\]]/i.test(s)) return '建议';
-        if (/^[【\[]\s*(需求|Requirement|Feature|User Story|Story)\s*[】\]]/i.test(s)) return '需求';
-        if (/^[【\[]\s*(文档编写|文档|Documentation|Docs?)\s*[】\]]/i.test(s)) return '文档编写';
-        if (/^[【\[]\s*(Bug|BUG|缺陷|Defect|Issue|Fault)\s*[】\]]/i.test(s)) return 'BUG';
-        if (/^(建议|Suggestion|Improvement)\s*[:：]/i.test(s)) return '建议';
-        if (/^(需求|Requirement|Feature|User Story|Story)\s*[:：]/i.test(s)) return '需求';
-        if (/^(文档编写|文档|Documentation|Docs?)\s*[:：]/i.test(s)) return '文档编写';
-        if (/^(缺陷|Bug|BUG|Defect|Issue|Fault)\s*[:：]/i.test(s)) return 'BUG';
-        if (/^(任务|Task|Epic|史诗|其他|Other)\s*[:：]/i.test(s)) return '其他';
-        if (/^(Suggestion|Improvement)\b/i.test(s)) return '建议';
-        if (/^(Feature|Requirement|User Story|Story)\b/i.test(s)) return '需求';
-        if (/^(Documentation|Docs?)\b/i.test(s)) return '文档编写';
-        if (/^(Bug|Defect|Issue|Fault)\b/i.test(s)) return 'BUG';
-        if (/^(Task|Epic|Milestone|Phase|Support)\b/i.test(s)) return '其他';
-        return '';
-      }
+      // 注意：本函数经 page.evaluate 序列化后在浏览器里执行，不能引用 Node 侧作用域
+      // （classifyWpType 等），因此把别名表当参数传进来并在此内联实现。
+      const classify = (raw) => {
+        const aliases = TYPE_ALIASES_ARG;
+        const isAscii = (v) => /^[A-Za-z][A-Za-z ]*$/.test(String(v || '').trim());
+        const fold = (v) => {
+          const t = String(v || '').toLowerCase().replace(/[^a-z]/g, '');
+          let out = '';
+          for (let i = 0; i < t.length; i += 2) {
+            const a = t[i], b = t[i + 1];
+            if (b === undefined) { out += a; break; }
+            out += a <= b ? a + b : b + a;
+          }
+          return out;
+        };
+        const hit = (alias, s) => {
+          if (!alias) return false;
+          if (s === alias) return true;
+          if (isAscii(alias) && isAscii(s)) return fold(s) === fold(alias);
+          return s.replace(/\s+/g, '') === String(alias).replace(/\s+/g, '');
+        };
+        const inner = (s0, depth) => {
+          const s = String(s0 || '').trim();
+          if (!s || depth > 3) return '';
+          for (let i = 0; i < aliases.length; i++) {
+            const type = aliases[i][0], list = aliases[i][1];
+            for (let j = 0; j < list.length; j++) if (hit(list[j], s)) return type;
+          }
+          const dig = (sub) => {
+            const t = String(sub || '').trim();
+            if (!t || t === s) return '';
+            return inner(t, depth + 1);
+          };
+          const trail = s.match(/[（(]\s*([^（()）]{1,24})\s*[)）]\s*$/);
+          if (trail) { const r = dig(trail[1]); if (r) return r; }
+          const pre = s.match(/^[【\[]\s*([^】\]]{1,24})\s*[】\]]/) || s.match(/^([^:：]{1,24})\s*[:：]/);
+          if (pre) { const r = dig(pre[1]); if (r) return r; }
+          const word = s.match(/^([A-Za-z][A-Za-z ]{0,20}?)\b[\s:：-]+(.+)$/);
+          if (word) { const r = dig(word[1]); if (r) return r; }
+          return '';
+        };
+        return inner(raw, 0);
+      };
       const typeCandidates = [];
       document.querySelectorAll(
         '.wp-type--status, .work-packages--subject-header--type, [data-test-selector="op-wp-single-type"], ' +
@@ -1405,7 +1831,9 @@ async function validateBugs(onLogCallback, options = {}) {
         if (hit) { type = hit; break; }
       }
       if (!type && hint) type = classify(hint);
-      if (!type) type = 'BUG';
+      // 角标/属性/标题/列表提示全都认不出来 → 不再默认当 BUG（那会把新类型静默按 BUG 校验），
+      // 标记为「未知类型」由服务端跳过并在日志中暴露，人工补充 TYPE_ALIASES 即可。
+      if (!type) type = '未知类型';
       return {
         attrs,
         description: descEl ? descEl.innerText : '',
@@ -1414,7 +1842,7 @@ async function validateBugs(onLogCallback, options = {}) {
         type,
         longYanChanges
       };
-    }, listTypeHint);
+    }, { hint: listTypeHint, aliases: TYPE_ALIASES });
   }
 
   async function waitForPageReady(tab, timeoutMs) {
@@ -1479,19 +1907,33 @@ async function validateBugs(onLogCallback, options = {}) {
         await waitForPageReady(tab, 6000);
         data = await scrapeOnce(tab, listTypeHint);
       }
-      // 列表类型提示可纠正详情页误判（详情角标缺失时）
-      if (listTypeHint) {
+      // === 类型判定优先级（从权威到猜测）===
+      // 1) API 的 _links.type.title：数据库外键，绝对权威，不受标题措辞/父级影响
+      // 2) 列表页类型提示
+      // 3) 详情页角标/标题识别（scrapeOnce 内已做，可能是猜的）
+      const apiType = apiTypeById.get(id);
+      if (apiType) {
+        const mapped = classifyWpType(apiType) || (apiType === 'Bug' ? 'BUG' : '');
+        if (mapped && mapped !== data.type) {
+          log('  ↳ #' + id + ' 类型以 API 为准：' + data.type + ' → ' + mapped + '（API 报告 ' + apiType + '）');
+        }
+        data.type = mapped || UNKNOWN_TYPE;
+      } else if (listTypeHint) {
         const hintType = classifyWpType(listTypeHint);
-        // 仅当详情仍是默认 BUG、且列表明确是其它类型时才覆盖，避免标题误判
-        if (hintType && data.type === 'BUG' && hintType !== 'BUG') data.type = hintType;
+        // 详情默认 BUG 或未识别、且列表明确是其它类型时才覆盖，避免标题误判
+        if (hintType && (data.type === 'BUG' || data.type === UNKNOWN_TYPE) && hintType !== 'BUG') {
+          data.type = hintType;
+        }
       }
 
-      log('✓ 已获取 #' + id + ' 详情（' + (data.type || 'BUG') + '）');
+      log('✓ 已获取 #' + id + ' 详情（' + (data.type || UNKNOWN_TYPE) + '）');
       return buildBugFromParts(id, data);
     } catch (err) {
       console.error('  ⚠️ #' + id + ' 获取失败:', err.message.substring(0, 60));
-      // 不要用「需求」当失败占位，否则会被整行隐藏
-      const failType = classifyWpType(listTypeHint) || 'BUG';
+      // 优先用 API 的权威类型；其次列表提示；都没有才标未知（不冒充 BUG）
+      const failApiType = apiTypeById.get(id);
+      const failType = (failApiType && (classifyWpType(failApiType) || (failApiType === 'Bug' ? 'BUG' : '')))
+        || classifyWpType(listTypeHint) || UNKNOWN_TYPE;
       return { id, subject: '', type: failType, fetchFailed: true, hasLongYan: false, longYanChanges: [], raw: '', description: '',
                phenomenon: '', reproduceCondition: '', reproduceProb: '', reproduceSteps: '',
                expectedResult: '', actualResult: '', reproduceLatest: '', reproduceLatestShort: '',
@@ -1517,8 +1959,19 @@ async function validateBugs(onLogCallback, options = {}) {
     bugs.push(...results);
   }
 
-  const bugCount = bugs.filter(b => b.type !== '需求').length;
-  log('数据获取完成，共 ' + bugCount + ' 个待校验项');
+  const bugCount = bugs.filter(b => VALIDATED_TYPES.includes(b.type)).length;
+  const skippedTypes = bugs.filter(b => SKIP_TYPES.includes(b.type));
+  const unknownBugs = bugs.filter(b => b.type === UNKNOWN_TYPE && !b.fetchFailed);
+  log('数据获取完成，共 ' + bugCount + ' 个待校验项' +
+    (skippedTypes.length ? '（已跳过 ' + skippedTypes.length + ' 个非缺陷单：' +
+      Array.from(new Set(skippedTypes.map(b => b.type))).join('/') + '）' : ''));
+  if (unknownBugs.length) {
+    // 不静默当 BUG 校验：明确列出，提示人工登记类型
+    log('⚠️ 有 ' + unknownBugs.length + ' 个单子类型未识别，已跳过校验（不会按 BUG 校验）：#' +
+      unknownBugs.slice(0, 20).map(b => b.id).join(' #') +
+      (unknownBugs.length > 20 ? ' 等' : ''));
+    log('   如属正常类型，请将其名称补入 src/validate-server.js 的 TYPE_ALIASES');
+  }
   timeLog('数据获取');
   
   // ===== 校验 =====
@@ -1540,25 +1993,28 @@ async function validateBugs(onLogCallback, options = {}) {
       continue;
     }
 
-    if (bug.type === '需求' || bug.type === '其他') {
-      // 需求 / 任务、Epic 等：非缺陷单，跳过校验
-      const skipName = bug.type === '需求' ? '需求' : (bug.type || '其他');
-      checks.push({ name: '必填项', pass: true, details: ['⏭️ ' + skipName + '类型，跳过校验'] });
-      checks.push({ name: '人员', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
-      checks.push({ name: '版本', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
-      checks.push({ name: '模块', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
-      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
+    // 未识别类型：不按 BUG 校验，也不计入统计（可能只是新类型未登记）
+    if (bug.type === UNKNOWN_TYPE) {
+      checks.push({ name: '必填项', pass: true, details: ['⏭️ 类型未识别，跳过 BUG 校验（请人工确认该单类型）'] });
+      checks.push({ name: '人员', pass: true, details: ['⏭️ 类型未识别，跳过'] });
+      checks.push({ name: '版本', pass: true, details: ['⏭️ 类型未识别，跳过'] });
+      checks.push({ name: '模块', pass: true, details: ['⏭️ 类型未识别，跳过'] });
+      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ 类型未识别，跳过'] });
       results.push({ id: bug.id, subject: bug.subject, type: bug.type, checks });
       continue;
     }
 
-    if (bug.type === '文档编写') {
-      // 文档编写：非缺陷单，跳过 BUG 规则
-      checks.push({ name: '必填项', pass: true, details: ['⏭️ 文档编写类型，跳过 BUG 校验'] });
-      checks.push({ name: '人员', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
-      checks.push({ name: '版本', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
-      checks.push({ name: '模块', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
-      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ 文档编写类型，跳过'] });
+    // 非缺陷单：需求 / 任务、Epic 等「其他」/ 文档编写 / 测试 → 一律跳过 BUG 规则
+    if (SKIP_TYPES.includes(bug.type)) {
+      const skipName = bug.type || '其他';
+      const skipNote = (skipName === '文档编写' || skipName === '测试')
+        ? '⏭️ ' + skipName + '类型，跳过 BUG 校验'
+        : '⏭️ ' + skipName + '类型，跳过校验';
+      checks.push({ name: '必填项', pass: true, details: [skipNote] });
+      checks.push({ name: '人员', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
+      checks.push({ name: '版本', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
+      checks.push({ name: '模块', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
+      checks.push({ name: '关联工艺', pass: true, details: ['⏭️ ' + skipName + '类型，跳过'] });
       results.push({ id: bug.id, subject: bug.subject, type: bug.type, checks });
       continue;
     }
@@ -1592,11 +2048,22 @@ async function validateBugs(onLogCallback, options = {}) {
       sugModule.push(modResult.pass ? '✓ 模块' + modResult.detail : '❌ 模块' + modResult.detail);
 
       const foundIsMulti = bug.foundVersions && /[\n,，、]/.test(bug.foundVersions);
-      const expectedReleasePhase = foundIsMulti ? 'Product Release' : 'DEV';
-      if ((bug.releasePhase || '').toLowerCase() !== expectedReleasePhase.toLowerCase()) {
-        sugVersion.push('❌ 发现BUG版本' + (foundIsMulti ? '多选' : '单选') + '，Release Phase应为"' + expectedReleasePhase + '"，当前: ' + (bug.releasePhase || '空'));
+      const rpNow = (bug.releasePhase || '').toLowerCase();
+      if (foundIsMulti) {
+        // 多选：期望 Product Release
+        if (rpNow !== 'product release') {
+          sugVersion.push('❌ 发现BUG版本多选，Release Phase应为"Product Release"，当前: ' + (bug.releasePhase || '空'));
+        } else {
+          sugVersion.push('✓ Release Phase = Product Release(多选)');
+        }
       } else {
-        sugVersion.push('✓ Release Phase = ' + expectedReleasePhase + (foundIsMulti ? '(多选)' : '(单选)'));
+        // 单选：只要求「非 Product Release」，具体该填 DEV 还是其它需人工判断
+        if (rpNow === 'product release') {
+          sugVersion.push('❌ 发现BUG版本单选，Release Phase不应为"Product Release"，当前: ' + (bug.releasePhase || '空'));
+        } else {
+          sugVersion.push('✓ Release Phase = ' + (bug.releasePhase || '空') + '(单选，非 Product Release)');
+        }
+        sugVersion.push('⚠️ 发现BUG版本单选，Release Phase 具体取值(DEV等)请自行判断');
       }
       if ((bug.version || '').toLowerCase() !== 'product backlog') {
         sugVersion.push('❌ 版本应为"Product backlog"，当前: ' + (bug.version || '空'));
@@ -1604,7 +2071,8 @@ async function validateBugs(onLogCallback, options = {}) {
         sugVersion.push('✓ 版本 = Product backlog');
       }
 
-      const passOf = (arr) => arr.every(d => d.includes('✓'));
+      // ⚠️ 开头的行是「需自行判断」提示，不参与通过判定
+      const passOf = (arr) => arr.filter(d => !d.startsWith('⚠️')).every(d => d.includes('✓'));
       checks.push({ name: '必填项', pass: passOf(sugRequired), details: sugRequired });
       checks.push({ name: '人员', pass: passOf(sugPerson), details: sugPerson });
       checks.push({ name: '版本', pass: passOf(sugVersion), details: sugVersion });
@@ -1748,8 +2216,16 @@ async function validateBugs(onLogCallback, options = {}) {
             if (skipVersion) {
               versionDetails.push('⏭️ 版本(Version) 被' + lyWho(lyFields, '版本', 'Version') + '修改，跳过校验（当前: ' + (bug.version || '空') + '）');
             } else if (bVer) {
-              if (bug.version !== bVer) versionDetails.push('❌ 版本应为"' + bVer + '"，当前: ' + bug.version);
-              else versionDetails.push('✓ 版本 = ' + bVer + ' ✓');
+              // 放宽：控制器版本 1.x.y 允许 Version 填 1.x.z（前两段必须一致，仅第三段可不同）
+              // 例：控制器 1.15.0 → Version 可填 1.15.1
+              if (versionMatchesCtrl(bug.version, bVer)) {
+                const sameExact = bug.version === bVer;
+                versionDetails.push('✓ 版本 = ' + bug.version +
+                  (sameExact ? ' ✓' : '（与控制器版本 ' + bVer + ' 同属 ' + majorMinor(bVer) + '.x，允许）✓'));
+              } else {
+                versionDetails.push('❌ 版本应为"' + bVer + '"或同属"' + majorMinor(bVer) +
+                  '.x"，当前: ' + bug.version);
+              }
             }
           } else if (vt === 'stable') {
             if (skipVersion) {
@@ -1843,20 +2319,25 @@ async function validateBugs(onLogCallback, options = {}) {
       details: moduleDetails
     });
     const craftDetails = [];
-    const allText = (bug.reproduceSteps + ' ' + bug.phenomenon + ' ' + bug.reproduceCondition + ' ' + bug.description).substring(0, 3000);
-    const hasWeld = /(激光|弧焊|焊接|切割|点焊|折弯|中厚板|冲压|码垛|搬运|熔覆)/.test(allText);
-
-    if (hasWeld) {
-      const craftVal = bug.attrs['关联工艺'] || '';
-      if (craftVal && craftVal !== '-') {
-        craftDetails.push('✓ 含工艺关键词，关联工艺已填: ' + craftVal);
-      } else {
-        craftDetails.push('❌ BUG含工艺关键词（激光/弧焊/焊接/切割/点焊/折弯/中厚板/冲压/码垛/搬运/熔覆），但关联工艺为空');
-      }
+    if (craftRuleEnabled === false) {
+      // 开关关闭：按现有的「⏭️ 跳过」约定输出，pass 为 true，不影响整体结论
+      craftDetails.push('⏭️ 关联工艺校验已在设置中关闭，跳过');
     } else {
-      craftDetails.push('✓ 不含工艺关键词，无需关联工艺');
+      const allText = (bug.reproduceSteps + ' ' + bug.phenomenon + ' ' + bug.reproduceCondition + ' ' + bug.description).substring(0, 3000);
+      const hasWeld = /(激光|弧焊|焊接|切割|点焊|折弯|中厚板|冲压|码垛|搬运|熔覆)/.test(allText);
+
+      if (hasWeld) {
+        const craftVal = bug.attrs['关联工艺'] || '';
+        if (craftVal && craftVal !== '-') {
+          craftDetails.push('✓ 含工艺关键词，关联工艺已填: ' + craftVal);
+        } else {
+          craftDetails.push('❌ BUG含工艺关键词（激光/弧焊/焊接/切割/点焊/折弯/中厚板/冲压/码垛/搬运/熔覆），但关联工艺为空');
+        }
+      } else {
+        craftDetails.push('✓ 不含工艺关键词，无需关联工艺');
+      }
     }
-    checks.push({ name: '关联工艺', pass: craftDetails.every(d => d.includes('✓')), details: craftDetails });
+    checks.push({ name: '关联工艺', pass: craftDetails.every(d => d.includes('✓') || d.startsWith('⏭️')), details: craftDetails });
     
     results.push({
       id: bug.id,
@@ -1872,7 +2353,7 @@ async function validateBugs(onLogCallback, options = {}) {
   try { await browser.close(); } catch {}
   timeLog('总耗时');
   sendProgress(100);
-  return { bugs: results.filter(b => b.type !== '需求'), logs, opOrigin };
+  return { bugs: results.filter(b => VALIDATED_TYPES.includes(b.type)), logs, opOrigin };
 }
 
 // ===== 结果落盘（定时任务 / 网页共用）=====
@@ -1881,7 +2362,7 @@ const LAST_REPORT_FILE = path.join(DATA_DIR, 'last_report.html');
 const SUMMARY_FILE = path.join(DATA_DIR, 'result_summary.json');
 
 function countSummary(bugs) {
-  const list = (bugs || []).filter(b => b.type === 'BUG' || b.type === '建议');
+  const list = (bugs || []).filter(b => VALIDATED_TYPES.includes(b.type));
   return {
     total: list.length,
     pass: list.filter(b => b.checks && b.checks.every(c => c.pass)).length,
@@ -1891,7 +2372,7 @@ function countSummary(bugs) {
 }
 
 async function saveValidationArtifacts(result) {
-  const bugs = (result.bugs || []).filter(b => b.type === 'BUG' || b.type === '建议');
+  const bugs = (result.bugs || []).filter(b => VALIDATED_TYPES.includes(b.type));
   const summary = countSummary(bugs);
   try { require('fs').writeFileSync(SUMMARY_FILE, JSON.stringify(summary), 'utf-8'); } catch {}
   try {
@@ -2072,7 +2553,7 @@ function buildLastReportHtml(data) {
         const e = escapeHtml(d);
         const isLyEditLine = (d.startsWith('⏭️') && (d.includes('龙燕') || d.includes('黄贵良'))) ||
           ((d.includes('龙燕') || d.includes('黄贵良')) && d.includes('修改'));
-        if (isLyEditLine || d.startsWith('❌') || d.startsWith('🔄'))
+        if (isLyEditLine || d.startsWith('❌') || d.startsWith('⚠️') || d.startsWith('🔄'))
           return '<span style="color:#d00;font-weight:bold">' + e + '</span>';
         if (d.startsWith('✓') || d.startsWith('✅') || d.startsWith('📋') || d.startsWith('⏭️') || d.includes('通过'))
           return '<span style="color:#0a0">' + e + '</span>';
@@ -2224,6 +2705,16 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(getHTML());
+  } else if (req.url === '/spec-status' && req.method === 'GET') {
+    // 规格表加载状态，供 UI 顶部横幅提示（用户改坏 JSON 时不至于静默）
+    try {
+      const st = moduleData.getLoadState();
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify(st));
+    } catch (e) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: e.message }));
+    }
   } else if (req.url === '/settings' && req.method === 'GET') {
     const cfg = loadServerConfig();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -2236,7 +2727,8 @@ const server = http.createServer(async (req, res) => {
       tester: cfg.tester,
       dingtalkEnabled: cfg.dingtalkEnabled,
       dingtalkWebhook: cfg.dingtalkWebhook,
-      dingtalkSecret: cfg.dingtalkSecret
+      dingtalkSecret: cfg.dingtalkSecret,
+      craftRuleEnabled: cfg.craftRuleEnabled !== false
     }));
   } else if (req.url === '/settings' && req.method === 'POST') {
     const raw = await new Promise((resolve) => {
@@ -2289,6 +2781,8 @@ const server = http.createServer(async (req, res) => {
         if (parsed.versionOrder) settings.versionOrder = parseVersionOrder(parsed.versionOrder);
         if (parsed.responsible) settings.responsible = String(parsed.responsible).trim();
         if (parsed.tester) settings.tester = String(parsed.tester).trim();
+        // 关联工艺开关：布尔值要显式判断，false 也是有效值
+        if (parsed.craftRuleEnabled != null) settings.craftRuleEnabled = !!parsed.craftRuleEnabled;
         // 钉钉推送用服务端配置，validate 请求无需携带
       } catch {}
     }
@@ -2311,6 +2805,7 @@ const server = http.createServer(async (req, res) => {
         res.end();
       }
     } catch (err) {
+      console.error('💥 校验失败:', err);
       if (!clientDisconnected) {
         try { res.write(JSON.stringify({ type: 'error', message: err.message }) + '\n'); } catch {}
         res.end();
